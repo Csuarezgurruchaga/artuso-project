@@ -8,7 +8,7 @@
 const CONFIG = {
   EMAILS_ORIGEN: ['artusoexpensas2@gmail.com'],
   EMAIL_DESTINO: 'artusoexpensas2@gmail.com', // se mantiene igual, pero NO se usa para reenviar
-  ETIQUETA_PROCESADO: 'ExpensaDetectada',
+  ETIQUETA_PROCESADO: 'ExpensaProcesada',
   ETIQUETA_DESCARTADO: 'ExpensaDescartada',
   DEBUG: true
 };
@@ -504,6 +504,12 @@ Regla: reject SOLO con evidencia negativa clara. Si no, uncertain.
 
 El campo reason debe ser muy conciso (máx 12 palabras).`;
 
+function getRequiredConfigString_(value, keyName) {
+  const v = (value || '').toString().trim();
+  if (!v) throw new Error(`CONFIG inválida: falta ${keyName}`);
+  return v;
+}
+
 // ==================== FUNCIONES DE IA ====================
 
 /**
@@ -690,12 +696,14 @@ function procesarEmailsExpensas() {
 function procesarEmailsDeCuenta(emailOrigen) {
   const stats = { procesados: 0, reenviados: 0, errores: 0 };
   try {
-    const query = `in:inbox -label:${CONFIG.ETIQUETA_PROCESADO} -label:${CONFIG.ETIQUETA_DESCARTADO} newer_than:1d`;
+    const labelProcesadoName = getRequiredConfigString_(CONFIG.ETIQUETA_PROCESADO, 'ETIQUETA_PROCESADO');
+    const labelDescartadoName = (CONFIG.ETIQUETA_DESCARTADO || 'ExpensaDescartada').toString().trim();
+    const query = `in:inbox -label:${labelProcesadoName} -label:${labelDescartadoName} newer_than:1d`;
     const threads = GmailApp.search(query, 0, 50);
     log(`(Central) Threads nuevos: ${threads.length}`);
 
-    const etiqueta = crearObtenerEtiqueta(CONFIG.ETIQUETA_PROCESADO);
-    const etiquetaDescartado = crearObtenerEtiqueta(CONFIG.ETIQUETA_DESCARTADO);
+    const etiqueta = crearObtenerEtiqueta(labelProcesadoName);
+    const etiquetaDescartado = crearObtenerEtiqueta(labelDescartadoName);
 
     threads.forEach(thread => {
       const threadUrl = `https://mail.google.com/mail/u/0/#all/${thread.getId()}`;

@@ -9,6 +9,7 @@ const CONFIG = {
   EMAILS_ORIGEN: ['artusoexpensas2@gmail.com'],
   EMAIL_DESTINO: 'artusoexpensas2@gmail.com', // se mantiene igual, pero NO se usa para reenviar
   ETIQUETA_PROCESADO: 'ExpensaDetectada',
+  ETIQUETA_DESCARTADO: 'ExpensaDescartada',
   DEBUG: true
 };
 
@@ -63,6 +64,17 @@ const SHEET_CONFIG = {
 
 const LOCALES_SEMICOLON = ['es', 'fr', 'de', 'it', 'pt', 'nl', 'da', 'fi', 'no', 'sv', 'pl', 'ru'];
 
+// ==================== OCR (Drive) ====================
+// OCR via Google Drive -> Google Doc. Costo $0, pero puede ser lento.
+const OCR_CONFIG = {
+  ENABLED: true,
+  OCR_LANGUAGE: 'es',
+  MAX_BLOBS: 3,                 // límite por email
+  MAX_BYTES: 4 * 1024 * 1024,   // 4MB por archivo (ajustable)
+  MIN_INLINE_IMAGE_BYTES: 30 * 1024, // ignora logos/firma
+  MAX_OCR_CHARS: 6000           // limita tokens al pasar al LLM
+};
+
 /**
  * Determina el separador de argumentos de fórmula según el locale.
  */
@@ -70,6 +82,203 @@ function getFormulaSeparator(locale) {
   if (!locale) return ',';
   const normalized = locale.toLowerCase().split('_')[0];
   return LOCALES_SEMICOLON.includes(normalized) ? ';' : ',';
+}
+
+function canUseDriveOcr_() {
+  // Requiere habilitar el servicio avanzado "Drive API" en Apps Script.
+  return typeof Drive !== 'undefined' && Drive && Drive.Files;
+}
+
+function isOcrSupported_(filename, contentType) {
+  const lower = (filename || '').toLowerCase();
+  if (contentType && contentType.indexOf('image/') === 0) return true;
+  if (contentType === 'application/pdf') return true;
+  return /\.(pdf|png|jpe?g)$/i.test(lower);
+}
+
+function truncateText_(text, maxChars) {
+  if (!text) return '';
+  const limit = maxChars || 0;
+  if (!limit || text.length <= limit) return text;
+  return text.substring(0, limit);
+}
+
+function composeBodyWithOcr_(plainBody, ocrText) {
+  const safeBody = plainBody || '';
+  const safeOcr = truncateText_(ocrText || '', OCR_CONFIG.MAX_OCR_CHARS);
+  if (!safeOcr) return safeBody;
+  // Poner OCR primero porque validateExpensePaymentWithLLM trunca el cuerpo.
+  return `=== OCR (adjuntos/imagenes) ===\n${safeOcr}\n\n=== CUERPO EMAIL ===\n${safeBody}`;
+}
+
+function hasMoneyAmount_(text) {
+  const t = (text || '').toString();
+  // $ 65.199,02 | 65199.02 | 65.000,00 | 1000000
+  return /(?:\$\s*)?\d{1,3}(?:[\.\s]\d{3})+(?:,\d{2})?|\$\s*\d{4,}|\b\d{1,3}(?:\.\d{3})+(?:,\d{2})\b|\b\d{4,}(?:[.,]\d{2})\b/.test(t);
+}
+
+function hasPaymentEvidence_(text) {
+  const t = (text || '').toString().toLowerCase();
+  const hasSignal = /(transferenc|comprobante|voucher|constancia|aviso de transferencia|recibiste un pago|pago fue exitoso|se acredit|realizaste|abon|deposit|mercado\s*pago|cbu|cvu|alias|nro|número de operación)/.test(t);
+  return hasSignal && (hasMoneyAmount_(t) || /\b(cbu|cvu|alias)\b/.test(t));
+}
+
+function extractSlashAddress_(text) {
+  const t = (text || '').toString();
+  // Calle/Av + número compuesto tipo 2647/51 (toma el match más largo)
+  const re = /\b((?:av\.?\s+|avenida\s+)?[a-záéíóúñ][a-záéíóúñ.'\-\s]{1,40}?)\s+(\d{1,5})\s*\/\s*(\d{1,5})\b/ig;
+  let match;
+  let best = null;
+  while ((match = re.exec(t)) !== null) {
+    const street = (match[1] || '').replace(/\s+/g, ' ').trim();
+    const n1 = match[2];
+    const n2 = match[3];
+    const candidate = `${street} ${n1}/${n2}`.replace(/\s+/g, ' ').trim();
+    if (!best || candidate.length > best.length) best = candidate;
+  }
+  return best;
+}
+
+function normalizePayor_(value) {
+  let s = (value || '').toString().trim();
+  if (!s) return null;
+  s = s.replace(/\s+/g, ' ');
+  s = s.replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/ig, '');
+  s = s.replace(/\b\d{2}-\d{8}-\d\b/g, ''); // CUIT con guiones
+  s = s.replace(/\b\d{11}\b/g, ''); // CUIT sin guiones
+  s = s.replace(/\s{2,}/g, ' ').trim();
+  if (!s) return null;
+  if (s.length > 60) s = s.substring(0, 60).trim();
+  return s || null;
+}
+
+function parseAmount_(value) {
+  if (value == null || value === '') return null;
+  if (typeof value === 'number') return isNaN(value) ? null : value;
+  let s = String(value).trim();
+  if (!s) return null;
+  s = s.replace(/\$/g, '').replace(/\s+/g, '');
+  // Formatos comunes AR: 65.199,02 o 80000,00
+  if (s.indexOf(',') !== -1 && s.indexOf('.') !== -1) {
+    // asumir '.' miles y ',' decimal
+    s = s.replace(/\./g, '').replace(',', '.');
+  } else if (s.indexOf(',') !== -1 && s.indexOf('.') === -1) {
+    s = s.replace(',', '.');
+  } else {
+    // eliminar separadores de miles por espacios ya removidos; dejar punto decimal si existe
+    s = s.replace(/(\d)\.(\d{3})(\D|$)/g, '$1$2$3');
+  }
+  const n = Number(s);
+  return isNaN(n) ? null : n;
+}
+
+function ocrBlobViaDrive_(blob, filename, ocrLanguage) {
+  if (!canUseDriveOcr_()) {
+    throw new Error('Drive API no habilitada (Advanced Service: Drive)');
+  }
+
+  const tempFile = DriveApp.createFile(blob.setName(filename));
+  let docId = null;
+
+  try {
+    const resource = {
+      title: filename,
+      mimeType: 'application/vnd.google-apps.document'
+    };
+    const docFile = Drive.Files.copy(resource, tempFile.getId(), {
+      ocr: true,
+      ocrLanguage: ocrLanguage || 'es'
+    });
+    docId = docFile && docFile.id ? docFile.id : null;
+    if (!docId) {
+      throw new Error('No se pudo crear el documento OCR');
+    }
+    const doc = DocumentApp.openById(docId);
+    return doc.getBody().getText();
+  } finally {
+    try {
+      if (docId) DriveApp.getFileById(docId).setTrashed(true);
+    } catch (e1) {}
+    try {
+      DriveApp.getFileById(tempFile.getId()).setTrashed(true);
+    } catch (e2) {}
+  }
+}
+
+function ocrAttachments_(attachments, opts) {
+  if (!attachments || attachments.length === 0) return '';
+  if (!OCR_CONFIG.ENABLED) return '';
+
+  if (!canUseDriveOcr_()) {
+    log('(Central) OCR deshabilitado: falta habilitar Advanced Service "Drive API"');
+    return '';
+  }
+
+  const parts = [];
+  let used = 0;
+
+  for (var i = 0; i < attachments.length && used < OCR_CONFIG.MAX_BLOBS; i++) {
+    const att = attachments[i];
+    const blob = att.copyBlob();
+    const name = att.getName ? (att.getName() || ('sin_nombre_' + i)) : ('sin_nombre_' + i);
+    const contentType = blob.getContentType ? (blob.getContentType() || '') : '';
+    const bytesLen = blob.getBytes().length;
+
+    if (!isOcrSupported_(name, contentType)) continue;
+    if (bytesLen > OCR_CONFIG.MAX_BYTES) continue;
+
+    try {
+      const text = ocrBlobViaDrive_(blob, name, OCR_CONFIG.OCR_LANGUAGE);
+      const cleaned = (text || '').trim();
+      if (!cleaned) continue;
+      parts.push('[' + ((opts && opts.source) ? opts.source : 'archivo') + ': ' + name + ']\n' + cleaned);
+      used++;
+    } catch (e) {
+      log('(Central) OCR error (' + name + '): ' + e.toString());
+    }
+  }
+
+  return parts.length ? parts.join('\n\n') : '';
+}
+
+function extraerTextoDeAdjuntosExpensa(message) {
+  if (!OCR_CONFIG.ENABLED) return '';
+  // Adjuntos "reales" (no inline)
+  const attachments = message.getAttachments({ includeInlineImages: false });
+  return ocrAttachments_(attachments, { source: 'adjunto' });
+}
+
+function extraerTextoDeImagenesEnCuerpo(message) {
+  if (!OCR_CONFIG.ENABLED) return '';
+
+  const withInline = message.getAttachments({ includeInlineImages: true });
+  const withoutInline = message.getAttachments({ includeInlineImages: false });
+
+  const fp = function(att, idx) {
+    const blob = att.copyBlob();
+    const bytesLen = blob.getBytes().length;
+    const name = att.getName ? (att.getName() || ('sin_nombre_' + idx)) : ('sin_nombre_' + idx);
+    const ct = blob.getContentType ? (blob.getContentType() || '') : '';
+    return [name, ct, bytesLen].join('|');
+  };
+
+  const base = {};
+  for (var i = 0; i < withoutInline.length; i++) base[fp(withoutInline[i], i)] = true;
+
+  const inlineOnly = [];
+  for (var j = 0; j < withInline.length; j++) {
+    const key = fp(withInline[j], j);
+    if (!base[key]) inlineOnly.push(withInline[j]);
+  }
+
+  // Filtrar imágenes chicas típicas de firma/logo
+  const filtered = [];
+  for (var k = 0; k < inlineOnly.length; k++) {
+    const blob = inlineOnly[k].copyBlob();
+    if (blob.getBytes().length >= OCR_CONFIG.MIN_INLINE_IMAGE_BYTES) filtered.push(inlineOnly[k]);
+  }
+
+  return ocrAttachments_(filtered, { source: 'inline' });
 }
 
 // ==================== ADAPTADORES IA (no modificar) ====================
@@ -242,51 +451,58 @@ const PALABRAS_EXCLUSION_FUERTE = [
   'gracias por informar el pago',  // es una respuesta, no un pago
   'muchas gracias por informar',
   'recibido, gracias',
-  'confirmamos recepción'
+  'confirmamos recepción',
+  // Excluir resúmenes automáticos internos (ruido)
+  'resumen procesamiento expensas',
+  // Entidades/temas que NO son pago de expensas (proveedores, cámaras, cobranzas)
+  'cámara argentina de la propiedad horizontal',
+  'camara argentina de la propiedad horizontal',
+  'actividades inmobiliarias',
+  'cooperativa de trabajo',
+  'mantenimiento integral',
+  'dto. comercial y cobranzas',
+  'comercial y cobranzas',
+  'presupuesto',
+  'impermeabilización',
+  'pintura en el sector de terrazas',
+  'reparacion',
+  'reparación'
 ];
 
+const REGEX_RESUMEN_PROCESAMIENTO = /^resumen\s+procesamiento\s+expensas\s+-\s+\d{2}\/\d{2}\/\d{4}$/i;
+
 // ==================== PROMPT DE VALIDACIÓN LLM ====================
-const VALIDATION_PROMPT = `Clasifica este email sobre expensas en 3 estados:
-- "accept" (pago de expensas)
-- "reject" (NO es pago de expensas)
-- "uncertain" (no hay evidencia suficiente; si hay duda, usar uncertain)
+const VALIDATION_PROMPT = `Tu tarea: entender la INTENCIÓN del email.
+Clasifica el email en 3 estados:
+- "accept": la intención es INFORMAR/CONFIRMAR un pago de expensas (aunque falten algunos datos).
+- "reject": la intención claramente NO es informar pago de expensas (p.ej. presupuesto, reclamo, proveedor, cobranzas/deuda, cuota de cámara, comunicación administrativa sin pago).
+- "uncertain": no está claro; ante la duda, dejar pasar como revisión humana.
+
+El email puede incluir una sección "=== OCR (adjuntos/imagenes) ===" con texto extraído.
 
 DEVUELVE SOLO este JSON válido (sin texto extra):
-{"decision":"accept|reject|uncertain","reason":"texto breve"}
+{"decision":"accept|reject|uncertain","reason":"texto muy breve"}
 
-──────────────────────────────────────────────
-EVIDENCIA DE PAGO (aceptar):
-- Pago ya realizado / transferencia realizada / se acreditó / pago recibido
-- Comprobante adjunto o indicado en texto ("adjunto comprobante", "voucher", "constancia")
-- Motivo/Concepto: EXPENSAS
-- Datos de transferencia: número de operación, CBU/CVU/alias, importe
-- Notificaciones bancarias o de cobro ("Recibiste un pago", "Se realizó la transferencia") con contexto de expensas/consorcio
-- Estado APROBADO en sistemas de expensas
-- Pagos mixtos (expensas + cochera/otros)
+Guía (no exhaustiva):
 
-EVIDENCIA NEGATIVA (rechazar SOLO si ves alguna de estas):
-- Solicitud/consulta de boleta/liquidación/deuda: "solicitar expensas", "no me han llegado", "reenviar boleta", "cuánto debo", "monto a pagar"
-- Factura/Proveedor/Presupuesto/TAD/Publicidad/Newsletter/Acta/Reclamo/Consulta no relacionada a pago
-- Comunicaciones administrativas sin confirmación de pago (convocatorias, actas, avisos)
-- Pagos ajenos al consorcio
+ACEPTAR si ves intención de pago:
+- "pagué/pagado/transferí/aboné", "aviso de transferencia", "tu pago fue exitoso", "recibiste un pago"
+- comprobante/voucher/constancia adjunta o datos de operación + monto
+- menciona expensas/consorcio/unidad/cochera/dirección del edificio
 
-INCERTIDUMBRE (usar "uncertain" si):
-- Falta evidencia suficiente de pago y no hay evidencia negativa clara
-- Solo adjuntos/imagenes sin texto que confirme pago
-- Cuerpo vacío o muy escaso, sin señales claras de pago ni de negativa
+RECHAZAR solo si la intención NO es pago de expensas:
+- presupuesto/pintura/impermeabilización/reparación/proveedor/factura de servicio
+- cobranzas/deuda/saldo pendiente/recordatorio de pago
+- recibo/cuota/inscripción/pago a una entidad (ej: Cámara) que no sea expensas del consorcio
+- reclamos/avisos (p.ej. "se encuentra esto en la cochera") sin pago
 
-REGLA:
-- reject: SOLO con evidencia negativa clara.
-- accept: si hay evidencia de pago/expensas.
-- uncertain: si no hay evidencia suficiente y tampoco negativa clara (ante la duda, usa uncertain).
+INCERTO (REVIEW) si:
+- hay comprobante/transferencia pero no queda claro que sea por expensas
+- hay señales mezcladas o falta contexto
 
-REGLA ESPECIAL (IMPORTANTE):
-- Si el email tiene evidencia clara de PAGO/TRANSFERENCIA (por ejemplo: menciona transferencia realizada, importe, CBU/CVU/alias, número de operación, \"recibiste un pago\", \"se realizó la transferencia\")
-  PERO no menciona explícitamente expensas/consorcio/motivo expensas, NO uses \"reject\".
-  En ese caso debes responder \"uncertain\" (y el sistema lo registrará como REVIEW para verificación humana).
+Regla: reject SOLO con evidencia negativa clara. Si no, uncertain.
 
-Formato obligatorio:
-{"decision":"accept|reject|uncertain","reason":"texto breve"}`;
+El campo reason debe ser muy conciso (máx 12 palabras).`;
 
 // ==================== FUNCIONES DE IA ====================
 
@@ -339,7 +555,7 @@ function callAI(prompt) {
  */
 function validateExpensePaymentWithLLM(subject, body) {
   // Truncar el cuerpo para optimizar tokens (2000 chars es suficiente para contexto)
-  const truncatedBody = body.substring(0, 2000);
+  const truncatedBody = (body || '').substring(0, 2000);
   const prompt = VALIDATION_PROMPT + `\n\nEmail:\nAsunto: ${subject}\nCuerpo: ${truncatedBody}`;
   
   try {
@@ -349,7 +565,7 @@ function validateExpensePaymentWithLLM(subject, body) {
     const json = JSON.parse(cleanResponse);
     const decision = (json.decision || '').toString().toLowerCase().trim();
     const reason = (json.reason || '').toString().trim();
-    const shortReason = reason.length > 120 ? reason.substring(0, 120) : reason;
+    const shortReason = reason.length > 80 ? reason.substring(0, 80) : reason;
 
     if (decision === 'reject') {
       return { isValid: false, review: false, reviewReason: shortReason || 'LLM_REJECT', decision };
@@ -376,11 +592,17 @@ function validateExpensePaymentWithLLM(subject, body) {
  * @returns {Object} - {monto, fecha_pago, dpto, estado}
  */
 function extractDataWithAI(subject, body) {
+  // Limitar para evitar prompts gigantes (p.ej. OCR largo)
+  const truncatedBody = truncateText_(body || '', 12000);
   const prompt = `Extrae la siguiente informacion de este email de pago de expensas.
 Responde UNICAMENTE con un JSON valido, sin explicaciones ni texto adicional.
 
+Nota: el cuerpo puede incluir una sección "=== OCR (adjuntos/imagenes) ===" con texto extraído por OCR.
+
 Campos a extraer:
-- monto: numero sin simbolo $ (ejemplo: 164185.30). Si no encuentras monto, usa null.
+- monto: numero sin simbolo $ (ejemplo: 164185.30). Si hay múltiples comprobantes, usa monto_total como principal. Si no encuentras monto, usa null.
+- montos: array de números (uno por comprobante/transferencia encontrada), sin símbolo $ y usando punto decimal (ej: 65199.02). Si no hay, usa [].
+- monto_total: suma de montos (si montos tiene más de 1 valor), mismo formato numérico. Si no aplica, usa null.
 - fecha_pago: formato DD-MM-YY. Si no hay fecha de pago explicita en el comprobante, usa null.
 - dpto: departamento/unidad/piso. Ejemplos de formatos válidos:
   - "5A", "PB B", "8 PISO", "LOC" (formatos simples)
@@ -390,11 +612,12 @@ Campos a extraer:
   - Normalizar siempre a "Cochera X" o "Cocheras X y Y" cuando se mencionen cocheras.
   Si no hay información de departamento/unidad, usa null.
 - estado: string en MAYUSCULAS (ej: "PENDIENTE", "APROBADO") si el email contiene un campo tipo "Estado: ...". Si no aparece, usa null. Si aparece "Estado: Pendiente", devuelve "PENDIENTE".
-- ed: direccion del edificio/consorcio (solo calle y numero, sin piso ni depto). Ejemplos: "Paraguay 2949", "Av Santa Fe 2647/51", "Araoz 380". Si no hay dirección, usa null.
+- ed: direccion del edificio/consorcio (solo calle y numero, sin piso ni depto). Debe preservar numeración compuesta tipo "2647/51". Ejemplos: "Paraguay 2949", "Av Santa Fe 2647/51", "Araoz 380". Si no hay dirección, usa null.
+- pagador: nombre y apellido o razón social que figure como titular/emisor/ordenante del comprobante (si aparece). Si no hay, usa null.
 
 Email:
 Asunto: ${subject}
-Cuerpo: ${body}
+Cuerpo: ${truncatedBody}
 
 JSON:`;
 
@@ -467,11 +690,12 @@ function procesarEmailsExpensas() {
 function procesarEmailsDeCuenta(emailOrigen) {
   const stats = { procesados: 0, reenviados: 0, errores: 0 };
   try {
-    const query = `in:inbox -label:${CONFIG.ETIQUETA_PROCESADO} newer_than:1d`;
+    const query = `in:inbox -label:${CONFIG.ETIQUETA_PROCESADO} -label:${CONFIG.ETIQUETA_DESCARTADO} newer_than:1d`;
     const threads = GmailApp.search(query, 0, 50);
     log(`(Central) Threads nuevos: ${threads.length}`);
 
     const etiqueta = crearObtenerEtiqueta(CONFIG.ETIQUETA_PROCESADO);
+    const etiquetaDescartado = crearObtenerEtiqueta(CONFIG.ETIQUETA_DESCARTADO);
 
     threads.forEach(thread => {
       const threadUrl = `https://mail.google.com/mail/u/0/#all/${thread.getId()}`;
@@ -479,26 +703,65 @@ function procesarEmailsDeCuenta(emailOrigen) {
         const messages = thread.getMessages();
         messages.forEach(message => {
           stats.procesados++;
+          const subjectPre = message.getSubject() || '';
+          if (REGEX_RESUMEN_PROCESAMIENTO.test(subjectPre.trim())) {
+            log(`(Central) SKIP resumen: ${subjectPre}`);
+            thread.addLabel(etiquetaDescartado);
+            return;
+          }
           if (esComprobanteExpensa(message)) {
             log(`(Central) ✓ Expensa detectada por keywords: ${message.getSubject()}`);
             
             const subject = message.getSubject();
             const body = message.getPlainBody();
+            const hasAttachments = message.getAttachments({ includeInlineImages: false }).length > 0;
 
             // Señal simple de "pago claro" (para debugging)
             const texto = `${subject} ${body}`.toLowerCase();
             const pagoClaro = /transferenc|recibiste un pago|pago fue exitoso|se acredit|realizaste/.test(texto) &&
               (/(?:\$\s*)?\d{1,3}(?:[\.\s]\d{3})+(?:,\d{2})?|\$\s*\d{4,}/.test(texto) || /\b(cbu|cvu|alias|nro|número)\b/.test(texto));
             
+            // PASO 0: OCR (solo si parece necesario)
+            // - Adjuntos, cuerpo vacío/escaso, o el texto sugiere que "va adjunto".
+            let ocrText = '';
+            const bodyLooksEmpty = !body || body.trim().length < 120;
+            const textSuggestsAttachment = /\badjunt|ver\s+archivo|comprobante\s+adjunto|imagen\s+adjunta/i.test(body || '') ||
+              /\badjunt|ver\s+archivo|comprobante\s+adjunto|imagen\s+adjunta/i.test(subject || '');
+
+            if (OCR_CONFIG.ENABLED && (hasAttachments || bodyLooksEmpty || textSuggestsAttachment)) {
+              const ocrAdj = extraerTextoDeAdjuntosExpensa(message);
+              const ocrInline = extraerTextoDeImagenesEnCuerpo(message);
+              ocrText = [ocrAdj, ocrInline].filter(Boolean).join('\n\n');
+              if (ocrText) {
+                log(`(Central) OCR agregado (chars=${ocrText.length})`);
+              }
+            }
+            const bodyForAI = composeBodyWithOcr_(body, ocrText);
+            const fullTextForRules = `${subject}\n${bodyForAI}`;
+
+            // Excluir por texto completo (incluye OCR) para frenar falsos positivos de adjuntos
+            const textoCompletoLower = fullTextForRules.toLowerCase();
+            const tieneExclusionFuerte = PALABRAS_EXCLUSION_FUERTE.some(p => textoCompletoLower.indexOf(p) !== -1);
+            if (tieneExclusionFuerte) {
+              log(`(Central) DESCARTADO por exclusión fuerte: ${subject}`);
+              thread.addLabel(etiquetaDescartado);
+              return;
+            }
+
             // PASO 1: Validar con LLM (fail-open con 3 estados)
-            const validation = validateExpensePaymentWithLLM(subject, body);
+            const validation = validateExpensePaymentWithLLM(subject, bodyForAI);
             log(`(Central) Validator: decision=${validation.decision || 'unknown'} review=${validation.review ? 'yes' : 'no'} reason=${validation.reviewReason || ''} pago_claro=${pagoClaro ? 'yes' : 'no'}`);
+            if (validation.review) {
+              log(`(Central) REVIEW (intención no clara): ${validation.reviewReason || 'LLM_UNCERTAIN'}`);
+            }
             
             if (!validation.isValid) {
               log(`(Central) ✗ LLM rejected: ${subject} | Reason: ${validation.reviewReason || 'LLM_REJECT'}`);
-              // No etiquetar ni procesar - el LLM determinó que no es un pago válido
+              // No etiquetar como expensa - evitar re-procesamiento
+              thread.addLabel(etiquetaDescartado);
               return;
             }
+            // Nota: si el LLM está en "review", dejamos pasar y lo marcamos en observaciones.
             
             // PASO 2: Extraer datos con IA y guardar en Sheet
             try {
@@ -508,8 +771,35 @@ function procesarEmailsDeCuenta(emailOrigen) {
                 'dd-MM-yy'
               );
               
-              const extractedData = extractDataWithAI(subject, body);
+              const extractedData = extractDataWithAI(subject, bodyForAI);
               const estado = (extractedData.estado || '').toString().trim().toUpperCase();
+
+              // Dirección con "/" (ej: 2647/51): preferir heurística si el LLM la truncó
+              const slashAddress = extractSlashAddress_(fullTextForRules);
+              if (slashAddress) {
+                const currentEd = (extractedData.ed || '').toString();
+                const hasSlash = /\d+\s*\/\s*\d+/.test(currentEd);
+                if (!hasSlash) extractedData.ed = slashAddress;
+              }
+
+              // Múltiples comprobantes: sumar montos si hay array
+              let amountToSave = parseAmount_(extractedData.monto);
+              const montos = extractedData.montos;
+              const parsedMontoTotal = parseAmount_(extractedData.monto_total);
+              if (parsedMontoTotal != null) {
+                amountToSave = parsedMontoTotal;
+              } else if (montos && montos.length && montos.length > 1) {
+                const sum = montos.reduce(function(acc, v) {
+                  const n = parseAmount_(v);
+                  return acc + (n == null ? 0 : n);
+                }, 0);
+                if (sum > 0) amountToSave = sum;
+              }
+
+              // ED incluye pagador si existe
+              const payor = normalizePayor_(extractedData.pagador);
+              const buildingBase = (extractedData.ed || '').toString().trim();
+              const buildingFinal = buildingBase && payor ? `${buildingBase} - ${payor}` : (buildingBase || null);
               
               const commentParts = [];
               if (validation.review) {
@@ -518,14 +808,17 @@ function procesarEmailsDeCuenta(emailOrigen) {
               if (estado === 'PENDIENTE') {
                 commentParts.push('ESTADO: PENDIENTE');
               }
+              if (montos && montos.length && montos.length > 1) {
+                commentParts.push(`MULTI: ${montos.length} comprobantes`);
+              }
               const labelSuffix = commentParts.length > 0 ? ` (${commentParts.join(' | ')})` : '';
               const rawLabel = `Abrir email${labelSuffix}`;
               
               saveToSheet(
                 noticeDate, 
                 extractedData.fecha_pago, 
-                extractedData.monto, 
-                extractedData.ed,
+                amountToSave, 
+                buildingFinal,
                 extractedData.dpto,
                 threadUrl,
                 rawLabel
@@ -566,11 +859,11 @@ function esComprobanteExpensa(message) {
   let criteriosCumplidos = [];
 
   // ===== EXCLUSIONES FUERTES (descarta inmediatamente) =====
-  const esRespuestaAgradecimiento = PALABRAS_EXCLUSION_FUERTE.some(p => textoCompleto.includes(p));
-  if (esRespuestaAgradecimiento) {
+  const tieneExclusionFuerte = PALABRAS_EXCLUSION_FUERTE.some(p => textoCompleto.includes(p));
+  if (tieneExclusionFuerte) {
     if (CONFIG.DEBUG) {
       log(`(Central) Clasificación: ${message.getSubject()}`);
-      log(`  DESCARTADO: Es respuesta/agradecimiento, no pago nuevo`);
+      log(`  DESCARTADO: Coincide con exclusión fuerte`);
     }
     return false;
   }
@@ -807,13 +1100,17 @@ function testAIExtraction() {
       const message = thread.getMessages()[0];
       const subject = message.getSubject();
       const body = message.getPlainBody();
+      const ocrAdj = extraerTextoDeAdjuntosExpensa(message);
+      const ocrInline = extraerTextoDeImagenesEnCuerpo(message);
+      const ocrText = [ocrAdj, ocrInline].filter(Boolean).join('\n\n');
+      const bodyForAI = composeBodyWithOcr_(body, ocrText);
       
       log(`--- Email ${index + 1}: ${subject} ---`);
       
       try {
-        const validation = validateExpensePaymentWithLLM(subject, body);
+        const validation = validateExpensePaymentWithLLM(subject, bodyForAI);
         log(`Validador: decision=${validation.isValid ? (validation.review ? 'ACCEPT_WITH_REVIEW' : 'ACCEPT') : 'REJECT'} | review=${validation.review ? (validation.reviewReason || 'LLM_UNCERTAIN') : 'none'}`);
-        const extractedData = extractDataWithAI(subject, body);
+        const extractedData = extractDataWithAI(subject, bodyForAI);
         log(`Monto: ${extractedData.monto}`);
         log(`Fecha pago: ${extractedData.fecha_pago}`);
         log(`Departamento: ${extractedData.dpto}`);
@@ -828,6 +1125,55 @@ function testAIExtraction() {
     log('=== FIN DE PRUEBA ===');
   } catch (error) {
     log(`Error en prueba de IA: ${error.toString()}`);
+  }
+}
+
+/**
+ * Prueba el OCR (Drive) sobre los últimos emails con adjuntos/imagenes inline.
+ * No llama a la IA: solo muestra el texto OCR en Logger.
+ *
+ * Requiere:
+ * - Habilitar Advanced Google Service "Drive API" en Apps Script
+ */
+function testDriveOcr() {
+  log('=== PRUEBA OCR (Drive) ===');
+  CONFIG.DEBUG = true;
+
+  if (!OCR_CONFIG.ENABLED) {
+    log('OCR_CONFIG.ENABLED=false; habilítalo para probar.');
+    return;
+  }
+
+  if (!canUseDriveOcr_()) {
+    log('Falta habilitar el servicio avanzado "Drive API".');
+    return;
+  }
+
+  try {
+    const query = 'in:inbox newer_than:14d has:attachment';
+    const threads = GmailApp.search(query, 0, 3);
+    log(`Threads encontrados: ${threads.length}`);
+
+    threads.forEach((thread, index) => {
+      const message = thread.getMessages()[0];
+      const subject = message.getSubject();
+      log(`--- Email ${index + 1}: ${subject} ---`);
+
+      const ocrAdj = extraerTextoDeAdjuntosExpensa(message);
+      const ocrInline = extraerTextoDeImagenesEnCuerpo(message);
+      const ocrText = [ocrAdj, ocrInline].filter(Boolean).join('\n\n');
+
+      if (!ocrText) {
+        log('OCR: (vacío)');
+      } else {
+        log(`OCR chars=${ocrText.length}`);
+        log(truncateText_(ocrText, 2500));
+      }
+    });
+
+    log('=== FIN PRUEBA OCR ===');
+  } catch (error) {
+    log(`Error en prueba OCR: ${error.toString()}`);
   }
 }
 

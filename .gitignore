@@ -1,0 +1,5 @@
+*.md
+.env
+false_positives
+examples
+*.png

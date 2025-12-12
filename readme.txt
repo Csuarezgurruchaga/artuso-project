@@ -1,0 +1,4 @@
+1)Los emails que fueron detectados como 'potencialmente expensa' se les agrega un cartel que dice 'ExpensaProcesada', si llega a haber algun email
+que no tiene cartel y es una expensa, avisar y reenviar de manera manual, para ver por que no detecto ese email como expensa.
+2) Tenemos 2 alternativas, podemos centralizar todas las expensas a el email artusoexpensas2@gmail.com. Lo cual probablemente genere que haya muchos emails en esa casilla (tal vez sea manejable), y luego el control fino sobre emails que no fueron detectados correctamente como pago de expensas, lo pueden realizar sobre ese email, para incluirlo en el .xlsx que se genera.
+La otra alternativa es trabajar con otro mail mas auxiliar a donde se reenvían todos los emails que se clasifican como expensa y si no se detectan, un humano los reenvía manualmente a ese email. Posteriormente el excel se genera automáticamente.

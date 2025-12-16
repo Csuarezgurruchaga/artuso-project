@@ -10,6 +10,12 @@ const CONFIG = {
   EMAIL_DESTINO: 'artusoexpensas2@gmail.com', // se mantiene igual, pero NO se usa para reenviar
   ETIQUETA_PROCESADO: 'ExpensaProcesada',
   ETIQUETA_DESCARTADO: 'ExpensaDescartada',
+  ETIQUETA_EN_PROCESO: 'ExpensaEnProceso',
+  ETIQUETA_REQUIERE_REVISION: 'REQUIERE REVISION',
+  DIAS_BUSQUEDA: 1,
+  MAX_THREADS_PER_RUN: 10,
+  MAX_MESSAGES_PER_THREAD: 20,
+  MAX_TOTAL_MESSAGES_PER_RUN: 40,
   DEBUG: true
 };
 
@@ -72,8 +78,12 @@ const OCR_CONFIG = {
   MAX_BLOBS: 3,                 // límite por email
   MAX_BYTES: 4 * 1024 * 1024,   // 4MB por archivo (ajustable)
   MIN_INLINE_IMAGE_BYTES: 30 * 1024, // ignora logos/firma
-  MAX_OCR_CHARS: 6000           // limita tokens al pasar al LLM
+  MAX_OCR_CHARS: 6000,          // limita tokens al pasar al LLM
+  MAX_OCR_CALLS_PER_RUN: 15,
+  STALE_EN_PROCESO_HOURS: 6
 };
+
+var OCR_CALLS_RUN = 0;
 
 /**
  * Determina el separador de argumentos de fórmula según el locale.
@@ -87,6 +97,78 @@ function getFormulaSeparator(locale) {
 function canUseDriveOcr_() {
   // Requiere habilitar el servicio avanzado "Drive API" en Apps Script.
   return typeof Drive !== 'undefined' && Drive && Drive.Files;
+}
+
+function isRateLimitError_(e) {
+  const msg = (e && (e.message || e.toString())) ? (e.message || e.toString()) : '';
+  const m = msg.toLowerCase();
+  return m.indexOf('rate limit') !== -1 ||
+    m.indexOf('user rate limit') !== -1 ||
+    m.indexOf('service invoked too many times') !== -1 ||
+    m.indexOf('quota') !== -1 ||
+    m.indexOf('429') !== -1 ||
+    m.indexOf('403') !== -1;
+}
+
+function withBackoff_(fn, attempts) {
+  const maxAttempts = typeof attempts === 'number' ? attempts : 6;
+  let delay = 800;
+  for (var i = 0; i < maxAttempts; i++) {
+    try {
+      return fn();
+    } catch (e) {
+      if (!isRateLimitError_(e) || i === maxAttempts - 1) throw e;
+      const jitter = Math.floor(Math.random() * 250);
+      const sleepMs = Math.min(12000, delay) + jitter;
+      log(`(Central) Rate limit, retry ${i + 1}/${maxAttempts} in ${sleepMs}ms`);
+      Utilities.sleep(sleepMs);
+      delay = delay * 2;
+    }
+  }
+  throw new Error('withBackoff_: unreachable');
+}
+
+function getThreadLeaseKey_(threadId) {
+  return `ENPROCESO_${threadId}`;
+}
+
+function escapeLabelForQuery_(labelName) {
+  const s = (labelName || '').toString();
+  return `"${s.replace(/"/g, '\\"')}"`;
+}
+
+function setThreadLease_(threadId, when) {
+  const iso = (when || new Date()).toISOString();
+  PropertiesService.getScriptProperties().setProperty(getThreadLeaseKey_(threadId), iso);
+}
+
+function clearThreadLease_(threadId) {
+  PropertiesService.getScriptProperties().deleteProperty(getThreadLeaseKey_(threadId));
+}
+
+function isThreadLeaseStale_(threadId, staleHours) {
+  const key = getThreadLeaseKey_(threadId);
+  const raw = PropertiesService.getScriptProperties().getProperty(key);
+  if (!raw) return true;
+  const d = new Date(raw);
+  if (isNaN(d.getTime())) return true;
+  const hours = (Date.now() - d.getTime()) / (1000 * 60 * 60);
+  return hours >= (staleHours || 6);
+}
+
+function scheduleRerun_(delayMs) {
+  const handler = 'procesarEmailsExpensas';
+  const triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    const t = triggers[i];
+    if (t.getHandlerFunction && t.getHandlerFunction() === handler) {
+      // Evitar acumulación: dejamos solo uno
+      ScriptApp.deleteTrigger(t);
+    }
+  }
+  const ms = Math.max(60000, Number(delayMs || 0)); // mínimo 1 min
+  ScriptApp.newTrigger(handler).timeBased().after(ms).create();
+  log(`(Central) RERUN programado en ${Math.round(ms / 60000)} min`);
 }
 
 function isOcrSupported_(filename, contentType) {
@@ -123,6 +205,42 @@ function hasPaymentEvidence_(text) {
   return hasSignal && (hasMoneyAmount_(t) || /\b(cbu|cvu|alias)\b/.test(t));
 }
 
+// Regla especial: descartar transferencias SALIENTES realizadas por Carlos Artuso.
+// Criterio: si aparece "Carlos" + "Artuso" y hay señales fuertes de "transferencia saliente",
+// entonces etiquetar como descartado, salvo que el mismo email indique explícitamente que fue ENTRANTE.
+function matchesCarlosArtusoName_(text) {
+  const t = normalizeForMatch_(text);
+  if (!t) return false;
+  return /\bcarlos\b/.test(t) && /\bartuso\b/.test(t);
+}
+
+function hasIncomingTransferSignal_(text) {
+  const t = normalizeForMatch_(text);
+  if (!t) return false;
+  // Señales típicas de transferencia/pago ENTRANTE
+  return (
+    /\b(recibiste|has recibido|se acredit|cobraste|importe cobrado|importe acreditado|pago recibido)\b/.test(t) &&
+    /\b(pago|transferenc)\b/.test(t)
+  );
+}
+
+function hasOutgoingTransferSignal_(text) {
+  const t = normalizeForMatch_(text);
+  if (!t) return false;
+  // Señales típicas de transferencia SALIENTE
+  const hasStrongPhrase = /\b(te informamos que realizaste|realizaste exitosamente|tu transferencia fue exitosa)\b/.test(t);
+  const hasVerbAndTransfer = /\b(realizaste|transferiste|enviaste|ordenaste)\b/.test(t) && /\btransferenc\b/.test(t);
+  return hasStrongPhrase || hasVerbAndTransfer;
+}
+
+function shouldDiscardOutgoingCarlosArtuso_(subject, body) {
+  const combined = `${subject || ''}\n${body || ''}`;
+  if (!matchesCarlosArtusoName_(combined)) return false;
+  // Precedencia: si es entrante, NO descartar (aunque aparezca el nombre).
+  if (hasIncomingTransferSignal_(combined)) return false;
+  return hasOutgoingTransferSignal_(combined);
+}
+
 function extractSlashAddress_(text) {
   const t = (text || '').toString();
   // Calle/Av + número compuesto tipo 2647/51 (toma el match más largo)
@@ -139,6 +257,100 @@ function extractSlashAddress_(text) {
   return best;
 }
 
+function normalizeEdForSheet_(edText) {
+  if (edText == null) return edText;
+  const s = (edText || '').toString().trim();
+  if (!s) return '';
+  return s.replace(/\s+/g, ' ').toLowerCase();
+}
+
+function extractEdFromEmailText_(text) {
+  const t = (text || '').toString();
+  if (!t) return null;
+  // Dirección simple: "Peron 2250" / "Pte. Perón 2248" / "Av Santa Fe 2647/51"
+  const re = /\b((?:av\.?\s+|avda\.?\s+|avenida\s+)?[a-záéíóúñ][a-záéíóúñ.'\-\s]{1,40}?)\s+(\d{1,5})(?:\s*\/\s*(\d{1,5}))?\b/i;
+  const m = re.exec(t);
+  if (!m) return null;
+  const street = (m[1] || '').replace(/\s+/g, ' ').trim();
+  const n1 = m[2];
+  const n2 = m[3];
+  const candidate = n2 ? `${street} ${n1}/${n2}` : `${street} ${n1}`;
+  return candidate.replace(/\s+/g, ' ').trim();
+}
+
+function extractDptoFromEmailText_(text) {
+  const t = (text || '').toString();
+  if (!t) return null;
+  // Preferir patrón con "/" o "dpto"
+  let m = /\/\s*([0-9]{1,2}\s*[A-Z])\b/i.exec(t);
+  if (m && m[1]) return m[1].replace(/\s+/g, '').toUpperCase();
+  m = /\b(?:dpto|depto|dto)\s*[:\-]?\s*([0-9]{1,2}\s*[A-Z])\b/i.exec(t);
+  if (m && m[1]) return m[1].replace(/\s+/g, '').toUpperCase();
+  return null;
+}
+
+function normalizeDpto_(raw) {
+  const s = (raw || '').toString().trim();
+  if (!s) return null;
+  // Normalizar guiones unicode comunes del OCR a "-"
+  const sClean = s.replace(/[‐‑–—−]/g, '-');
+  const n = normalizeForMatch_(s);
+
+  // Formatos especiales: no tocar
+  if (/\bpb\b/.test(n) || /\bloc(al)?\b/.test(n) || /\bcochera(s)?\b/.test(n)) return sClean;
+
+  // Caso: ya viene con "piso 0 dpto 4-c" y hay que corregir a piso 4 dpto c
+  let m = /^piso\s+0\s+dpto\s+0*([0-9]{1,2})\s*-\s*([a-z])$/i.exec(sClean);
+  if (m) {
+    const piso = String(parseInt(m[1], 10));
+    const letra = (m[2] || '').toUpperCase();
+    return `Piso ${piso} Dpto ${letra}`;
+  }
+
+  // Caso compacto: 04-C | 4-C | 4C | 2/C
+  const compact = sClean.replace(/\s+/g, '');
+  m = /^0*([0-9]{1,2})(?:[-\/])?([a-z])$/i.exec(compact);
+  if (m) {
+    const piso2 = String(parseInt(m[1], 10));
+    const letra2 = (m[2] || '').toUpperCase();
+    return `Piso ${piso2} Dpto ${letra2}`;
+  }
+
+  return sClean;
+}
+
+function extractCocheraDptoFromText_(text) {
+  const t = normalizeForMatch_(text);
+  if (!t) return null;
+  if (t.indexOf('cochera') === -1) return null;
+
+  const nums = [];
+  const seen = {};
+
+  function pushNum(raw) {
+    const s = (raw || '').toString().trim();
+    if (!s) return;
+    const n = parseInt(s.replace(/^0+/, ''), 10);
+    if (!n || isNaN(n)) return;
+    if (seen[n]) return;
+    seen[n] = true;
+    nums.push(n);
+  }
+
+  // "cocheras 20 y 21", "cochera20-21", "cochera 20,21", etc.
+  const re = /\bcocheras?\b[^0-9]{0,12}((?:0*\d{1,4}\s*(?:,|y|e|\/|-)\s*)*0*\d{1,4})/g;
+  let m;
+  while ((m = re.exec(t)) !== null) {
+    const block = m[1] || '';
+    const hits = block.match(/\b0*\d{1,4}\b/g);
+    if (!hits) continue;
+    for (var i = 0; i < hits.length; i++) pushNum(hits[i]);
+  }
+
+  if (!nums.length) return null;
+  return nums.map(function(n) { return `cochera${n}`; }).join(', ');
+}
+
 function normalizePayor_(value) {
   let s = (value || '').toString().trim();
   if (!s) return null;
@@ -150,6 +362,523 @@ function normalizePayor_(value) {
   if (!s) return null;
   if (s.length > 60) s = s.substring(0, 60).trim();
   return s || null;
+}
+
+const DIRECCIONES_ED_IGNORAR = [
+  // Dirección de la administración (no es el edificio del consorcio)
+  'sarmiento 1934'
+];
+
+function stripAccents_(text) {
+  return (text || '').toString()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+function normalizeForMatch_(text) {
+  return stripAccents_(text).toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function isLikelyHumanNameForEdFallback_(value) {
+  const raw = (value || '').toString().trim();
+  if (!raw) return false;
+  if (raw.length > 80) return false;
+  if (/@/.test(raw)) return false;
+  if (/\d/.test(raw)) return false;
+
+  const norm = normalizeForMatch_(raw);
+  const tokens = norm.split(' ').filter(Boolean);
+  if (tokens.length < 2) return false;
+  if (tokens.length > 6) return false;
+
+  const banned = [
+    'varios',
+    'expensa',
+    'expensas',
+    'pago',
+    'pagos',
+    'transferencia',
+    'transferencias',
+    'banco',
+    'online',
+    'banking',
+    'cuenta',
+    'cbu',
+    'cvu',
+    'alias',
+    'importe',
+    'monto',
+    'fecha',
+    'hora',
+    'operacion',
+    'operación',
+    'nro',
+    'numero',
+    'número',
+    'concepto',
+    'motivo',
+    'detalle'
+  ];
+  for (var i = 0; i < banned.length; i++) {
+    if (norm.indexOf(banned[i]) !== -1) return false;
+  }
+
+  return isLikelyPersonName_(raw);
+}
+
+function extractForwardedOriginalBody_(plainBody) {
+  const body = (plainBody || '').toString();
+  if (!body) return '';
+  const marker = '--- CONTENIDO ORIGINAL ---';
+  const idx = body.indexOf(marker);
+  if (idx === -1) return body;
+  return body.substring(idx + marker.length);
+}
+
+function extractSignatureNameCandidate_(plainBody) {
+  const original = extractForwardedOriginalBody_(plainBody);
+  const lines = (original || '').split(/\r?\n/).map(function(l) { return (l || '').trim(); }).filter(Boolean);
+  if (!lines.length) return null;
+
+  const maxLookback = 14;
+  for (var i = lines.length - 1; i >= 0 && (lines.length - i) <= maxLookback; i--) {
+    const line = lines[i];
+    const n = normalizeForMatch_(line);
+    if (!n) continue;
+    if (n.indexOf('enviado desde mi iphone') !== -1 || n.indexOf('sent from my iphone') !== -1) continue;
+    if (/^saludos\b|^saludos cordiales\b|^cordialmente\b|^atte\b|^atentamente\b|^gracias\b/.test(n)) continue;
+    if (/http|www\./.test(n)) continue;
+    if (/^--+$/.test(n)) continue;
+    if (n.indexOf('administraci') !== -1 || n.indexOf('consorcio') !== -1) continue;
+
+    const cleaned = normalizePayor_(line) || line;
+    if (cleaned && isLikelyHumanNameForEdFallback_(cleaned)) return cleaned.trim();
+  }
+
+  return null;
+}
+
+function extractLabeledFieldValues_(text, labelNames, maxLen) {
+  const t = (text || '').toString();
+  if (!t) return null;
+  const labels = (labelNames || []).map(function(l) { return normalizeForMatch_(l); }).filter(Boolean);
+  if (!labels.length) return null;
+  const limit = typeof maxLen === 'number' ? maxLen : 120;
+
+  const lines = t.split(/\r?\n/).map(function(l) { return (l || '').trim(); }).filter(Boolean);
+  const values = [];
+
+  function looksLikeOtherLabelLine_(lineNorm) {
+    if (!lineNorm) return false;
+    // Heurística: si contiene ":" y empieza con una palabra corta (label), es probablemente otro campo.
+    if (/^[a-záéíóúñ\s]{2,25}:\s*/.test(lineNorm)) return true;
+    // Campos comunes en comprobantes
+    return /^(fecha|hora|importe|monto|cbu|cvu|alias|banco|cuenta|moneda|nombre|beneficiario|destinatario|operacion|operación|nro|numero|número)\b/.test(lineNorm);
+  }
+
+  for (var i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const ln = normalizeForMatch_(line);
+    for (var j = 0; j < labels.length; j++) {
+      const label = labels[j];
+      if (!label) continue;
+      if (ln.indexOf(label) === -1) continue;
+
+      // Match "label: valor" o "label valor"
+      const esc = label.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+      const re = new RegExp('^\\s*' + esc + '\\s*[:\\-–—]?\\s*(.{1,' + limit + '})\\s*$', 'i');
+      const m = re.exec(line);
+      let value = null;
+      if (m && m[1] && m[1].trim() && normalizeForMatch_(m[1]) !== label) {
+        value = m[1].trim();
+      } else if (i + 1 < lines.length) {
+        const next = lines[i + 1];
+        const nextNorm = normalizeForMatch_(next);
+        if (!looksLikeOtherLabelLine_(nextNorm)) value = next.trim().substring(0, limit);
+      }
+
+      if (value) values.push({ label: label, value: value });
+    }
+  }
+
+  return values.length ? values : null;
+}
+
+function extractMotivoDetalleNameFromOcr_(ocrText) {
+  const found = extractLabeledFieldValues_(ocrText, ['motivo', 'detalle', 'referencia', 'concepto'], 120);
+  if (!found) return null;
+
+  const order = { motivo: 1, detalle: 2, referencia: 3, concepto: 4 };
+  found.sort(function(a, b) {
+    const la = (a && a.label) ? a.label : '';
+    const lb = (b && b.label) ? b.label : '';
+    return (order[la] || 99) - (order[lb] || 99);
+  });
+
+  for (var i = 0; i < found.length; i++) {
+    const v = (found[i] && found[i].value) ? String(found[i].value).trim() : '';
+    if (!v) continue;
+    const cleaned = normalizePayor_(v) || v;
+    if (cleaned && isLikelyHumanNameForEdFallback_(cleaned)) return cleaned.trim();
+  }
+
+  return null;
+}
+
+function extractConceptFieldValue_(text) {
+  // Captura "Referencia/Motivo/Concepto" en la misma línea o en la siguiente.
+  const found = extractLabeledFieldValues_(text, ['referencia', 'motivo', 'concepto'], 120);
+  if (!found) return null;
+  const out = [];
+  for (var i = 0; i < found.length; i++) {
+    const v = (found[i] && found[i].value) ? String(found[i].value).trim() : '';
+    if (!v) continue;
+    out.push(v);
+  }
+  return out.length ? out : null;
+}
+
+function matchesNonExpenseConcept_(text) {
+  const values = extractConceptFieldValue_(text);
+  if (!values) return null;
+  const normalizedTerms = CONCEPTOS_NO_EXPENSA.map(normalizeForMatch_);
+  for (var i = 0; i < values.length; i++) {
+    const vNorm = normalizeForMatch_(values[i]);
+    for (var j = 0; j < normalizedTerms.length; j++) {
+      const term = normalizedTerms[j];
+      if (!term) continue;
+      // Match por palabra completa cuando es corto (SAC)
+      if (term.length <= 3) {
+        const reWord = new RegExp('(^|\\b)' + term.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&') + '(\\b|$)', 'i');
+        if (reWord.test(vNorm)) return values[i];
+      } else if (vNorm.indexOf(term) !== -1) {
+        return values[i];
+      }
+    }
+  }
+  return null;
+}
+
+function getOcrSection_(bodyForAI) {
+  const t = (bodyForAI || '').toString();
+  const ocrIdx = t.indexOf('=== OCR');
+  if (ocrIdx === -1) return '';
+  const bodyIdx = t.indexOf('=== CUERPO EMAIL ===');
+  const slice = bodyIdx === -1 ? t.substring(ocrIdx) : t.substring(ocrIdx, bodyIdx);
+  return slice.replace(/^=== OCR.*?===\s*/i, '').trim();
+}
+
+function uniqueNormalizedAnchors_(anchors) {
+  const out = [];
+  const seen = {};
+  (anchors || []).forEach(function(a) {
+    const n = normalizeForMatch_(a);
+    if (!n) return;
+    if (seen[n]) return;
+    seen[n] = true;
+    out.push(n);
+  });
+  return out;
+}
+
+function getOcrAnchors_() {
+  const base = [
+    'depto', 'depto:', 'departamento', 'unidad', 'uf', 'edificio', 'caba',
+    'total', 'total a pagar', 'a pagar', 'importe', 'monto',
+    'fecha', 'venc', 'vencimiento',
+    'titular', 'titular:', 'ordenante', 'ordenante:', 'destinatario', 'destinatario:',
+    'cbu', 'cvu', 'alias',
+    'operación', 'operacion', 'nro', 'número', 'numero', 'referencia',
+    'comprobante', 'transferencia',
+    'concepto', 'motivo', 'expensas', 'expensa'
+  ];
+
+  const fromProject = []
+    .concat(PALABRAS_CLAVE_EXPENSA.referencia || [])
+    .concat(PALABRAS_CLAVE_EXPENSA.pago || [])
+    .concat(PALABRAS_CLAVE_EXPENSA.comprobante || [])
+    .concat(PALABRAS_CLAVE_EXPENSA.expensa || []);
+
+  return uniqueNormalizedAnchors_(base.concat(fromProject));
+}
+
+const EXTRACTOR_CONTEXT_LIMITS = {
+  EMAIL_BODY_MAX_CHARS: 8000,
+  OCR_FULL_MAX_CHARS: 12000
+};
+
+function detectReceiptLikeOcr_(ocrText) {
+  const t = normalizeForMatch_(ocrText);
+  if (!t) return false;
+  // Nota: OCR a veces elimina espacios/símbolos, así que evitamos word-boundaries estrictos.
+  const hasTransferWord = /(transferenc|comprobant|comprobante|voucher|operaci|transacci|nro|nº|n°|numero)/.test(t);
+  const hasBankFields = /(cbu|cvu|alias|banco|cuenta|cuit|cuil)/.test(t);
+  const hasAmount = hasMoneyAmount_(t) || /(importe|monto|total|a pagar)/.test(t);
+  const hasDate =
+    /(fecha|hora|venc)/.test(t) ||
+    /\b\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}\b/.test(t) ||
+    /\b\d{1,2}:\d{2}\b/.test(t);
+  // Considerar "comprobante" si hay monto + (transferencia o campos bancarios) + (fecha/hora o referencia/motivo/concepto)
+  return hasAmount && (hasTransferWord || hasBankFields) && (hasDate || /(referencia|motivo|concepto)/.test(t));
+}
+
+function extractPayerCuitFromOcr_(ocrText) {
+  const t = (ocrText || '').toString();
+  if (!t) return null;
+
+  const cuitRe = /\b(cuit\/cuil|cuit|cuil)\b\s*[: ]\s*([0-9]{2}-[0-9]{8}-[0-9])\b/ig;
+  let match;
+  while ((match = cuitRe.exec(t)) !== null) {
+    const cuit = match[2];
+    const before = t.substring(0, match.index);
+    const near = before.substring(Math.max(0, before.length - 200));
+    const nearNorm = normalizeForMatch_(near);
+
+    // Si cerca dice "para/destinatario/beneficiario", probablemente no es pagador
+    if (/\b(para|destinatario|beneficiario)\b/.test(nearNorm)) continue;
+
+    // Si cerca dice "de/originante/ordenante/titular", es buena señal de pagador
+    const hasPayerLabel = /\b(de|originante|ordenante|titular|origen)\b/.test(nearNorm);
+
+    // Buscar nombre en líneas previas
+    const lines = before.split(/\r?\n/).map(function(l) { return (l || '').trim(); }).filter(Boolean);
+    for (var i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      const lineNorm = normalizeForMatch_(line);
+      if (!line) continue;
+      if (lineNorm.indexOf('cuit') !== -1 || lineNorm.indexOf('cuil') !== -1) continue;
+      if (lineNorm === 'de' || lineNorm === 'para' || lineNorm === 'origen' || lineNorm === 'destino') continue;
+      if (/mercado\s*pago/i.test(line)) continue;
+      if (!isLikelyPersonName_(line)) continue;
+      if (!hasPayerLabel && i >= 1) {
+        const prevNorm = normalizeForMatch_(lines[i - 1]);
+        if (prevNorm.indexOf('para') !== -1 || prevNorm.indexOf('destinatario') !== -1) continue;
+      }
+      return { name: line.trim(), cuit: cuit, evidence: `${match[1]}: ${cuit}` };
+    }
+  }
+  return null;
+}
+
+function buildOcrEvidence_(ocrText, anchors, windowSize, maxChars) {
+  const t = (ocrText || '').toString();
+  if (!t) return '';
+  const lines = t.split(/\r?\n/).map(function(l) { return (l || '').trim(); }).filter(Boolean);
+  if (lines.length === 0) return '';
+
+  const a = anchors && anchors.length ? anchors : getOcrAnchors_();
+  const w = typeof windowSize === 'number' ? windowSize : 2;
+  const includeIdx = {};
+
+  for (var i = 0; i < lines.length; i++) {
+    const ln = normalizeForMatch_(lines[i]);
+    let hit = false;
+    for (var j = 0; j < a.length; j++) {
+      if (ln.indexOf(a[j]) !== -1) { hit = true; break; }
+    }
+    if (!hit) continue;
+    const start = Math.max(0, i - w);
+    const end = Math.min(lines.length - 1, i + w);
+    for (var k = start; k <= end; k++) includeIdx[k] = true;
+  }
+
+  const selected = [];
+  for (var idx = 0; idx < lines.length; idx++) {
+    if (includeIdx[idx]) selected.push(lines[idx]);
+  }
+  if (selected.length === 0) return '';
+
+  const joined = selected.join('\n');
+  return truncateText_(joined, maxChars || 3500);
+}
+
+function extractPayorFromOcr_(ocrText) {
+  const t = (ocrText || '').toString();
+  if (!t) return null;
+  let m = /\bTitular:\s*([^\n\r]{2,80})/i.exec(t);
+  if (m && m[1]) return m[1].trim();
+  m = /\bOrdenante:\s*([^\n\r]{2,80})/i.exec(t);
+  if (m && m[1]) return m[1].trim();
+  return null;
+}
+
+function extractFechaFromOcr_(ocrText) {
+  const t = (ocrText || '').toString();
+  if (!t) return null;
+  // DD/MM/YYYY o DD/MM/YY
+  const m = /\b(\d{2})\/(\d{2})\/(\d{2}|\d{4})\b/.exec(t);
+  if (!m) return null;
+  const yy = m[3].length === 4 ? m[3].substring(2) : m[3];
+  return `${m[1]}-${m[2]}-${yy}`;
+}
+
+function extractMontosFromOcr_(ocrText) {
+  const t = (ocrText || '').toString();
+  if (!t) return { montos: [], monto_total: null };
+  const lines = t.split(/\r?\n/).map(function(l) { return (l || '').trim(); }).filter(Boolean);
+  const montos = [];
+
+  const moneyRe = /(?:\$?\s*)(\d{1,3}(?:[.\s]\d{3})+(?:,\d{2})|\d{4,}(?:[.,]\d{2})?)/g;
+  for (var i = 0; i < lines.length; i++) {
+    const lnNorm = normalizeForMatch_(lines[i]);
+    if (!(/\b(total|a pagar|importe|monto)\b/.test(lnNorm))) continue;
+    moneyRe.lastIndex = 0;
+    let m;
+    while ((m = moneyRe.exec(lines[i])) !== null) {
+      const parsed = parseAmount_(m[1]);
+      if (parsed != null) montos.push(parsed);
+    }
+  }
+
+  // Monto total: preferir línea con "total" y "a pagar"
+  let montoTotal = null;
+  for (var j = 0; j < lines.length; j++) {
+    const lnN = normalizeForMatch_(lines[j]);
+    if (!(lnN.indexOf('total') !== -1 && (lnN.indexOf('a pagar') !== -1 || lnN.indexOf('apagar') !== -1))) continue;
+    moneyRe.lastIndex = 0;
+    const mm = moneyRe.exec(lines[j]);
+    if (mm && mm[1]) {
+      montoTotal = parseAmount_(mm[1]);
+      break;
+    }
+  }
+
+  // Dedupe montos
+  const uniq = [];
+  const seen = {};
+  montos.forEach(function(v) {
+    const key = String(v);
+    if (seen[key]) return;
+    seen[key] = true;
+    uniq.push(v);
+  });
+
+  return { montos: uniq, monto_total: montoTotal };
+}
+
+function buildOcrHints_(ocrText) {
+  const hints = {};
+  const ed = extractEdFromOcr_(ocrText);
+  const dpto = extractDeptoFromOcr_(ocrText) || extractDptoFromUnidadLike_(ocrText);
+  const uf = extractUfFromOcr_(ocrText);
+  const payor = extractPayorFromOcr_(ocrText);
+  const fecha = extractFechaFromOcr_(ocrText);
+  const amounts = extractMontosFromOcr_(ocrText);
+
+  if (ed) hints.ed = ed;
+  if (dpto) hints.dpto = dpto;
+  if (uf) hints.uf = uf;
+  if (payor) hints.pagador = payor;
+  if (fecha) hints.fecha = fecha;
+  if (amounts.montos && amounts.montos.length) hints.montos = amounts.montos;
+  if (amounts.monto_total != null) hints.monto_total = amounts.monto_total;
+
+  return hints;
+}
+
+function buildExtractorContext_(subject, plainBody, ocrFullText) {
+  const subjectSafe = (subject || '').toString();
+  const emailBodyFull = truncateText_((plainBody || '').toString(), EXTRACTOR_CONTEXT_LIMITS.EMAIL_BODY_MAX_CHARS);
+  const ocrFull = truncateText_((ocrFullText || '').toString(), EXTRACTOR_CONTEXT_LIMITS.OCR_FULL_MAX_CHARS);
+
+  const hints = buildOcrHints_(ocrFull);
+  const ocrEvidence = buildOcrEvidence_(ocrFull, getOcrAnchors_(), 2, 3500);
+
+  return [
+    'EMAIL_SUBJECT:',
+    subjectSafe,
+    '',
+    'EMAIL_BODY_FULL:',
+    emailBodyFull,
+    '',
+    'OCR_FULL:',
+    ocrFull,
+    '',
+    'HINTS_JSON (sugerencias; pueden estar incompletas o equivocadas):',
+    JSON.stringify(hints || {}),
+    '',
+    'OCR_EVIDENCE (recortado por ventanas):',
+    ocrEvidence || ''
+  ].join('\n');
+}
+
+function isIgnoredEd_(edText) {
+  const n = normalizeForMatch_(edText);
+  return DIRECCIONES_ED_IGNORAR.some(d => n.indexOf(d) !== -1);
+}
+
+function isValidEd_(edText) {
+  const ed = (edText || '').toString().trim();
+  if (!ed) return false;
+  if (isIgnoredEd_(ed)) return false;
+  // Debe parecer dirección: letras + número (o número compuesto)
+  if (!/[a-záéíóúñ].*\d/i.test(ed)) return false;
+  const n = normalizeForMatch_(ed);
+  // Evitar texto narrativo típico de recargos/vencimientos
+  if (/\bpor pago\b|\bfuera de termino\b|\bfuera de término\b|\brecargo\b|\bhasta el\b|\bvencim/i.test(n)) return false;
+  return true;
+}
+
+function extractEdFromOcr_(ocrText) {
+  const t = (ocrText || '').toString();
+  if (!t) return null;
+
+  // Prioridad 1: línea con "- CABA" (típicamente dirección del edificio)
+  const reCaba = /\b([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s.'\-]{2,60}?\s+\d{1,5}(?:\s*\/\s*\d{1,5})?)\s*-\s*CABA\b/ig;
+  let match;
+  let best = null;
+  while ((match = reCaba.exec(t)) !== null) {
+    const candidate = (match[1] || '').replace(/\s+/g, ' ').trim();
+    if (isValidEd_(candidate) && (!best || candidate.length > best.length)) best = candidate;
+  }
+  if (best) return best;
+
+  // Prioridad 2: cualquier "calle + número(/número)"
+  const candidates = [];
+  const reGeneric = /\b([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s.'\-]{2,60}?\s+\d{1,5}(?:\s*\/\s*\d{1,5})?)\b/g;
+  while ((match = reGeneric.exec(t)) !== null) {
+    const candidate2 = (match[1] || '').replace(/\s+/g, ' ').trim();
+    if (isValidEd_(candidate2)) candidates.push(candidate2);
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.length - a.length);
+  return candidates[0];
+}
+
+function extractDeptoFromOcr_(ocrText) {
+  const t = (ocrText || '').toString();
+  if (!t) return null;
+  // "Depto: 03-C"
+  const m = /\bDepto:\s*([0-9]{1,3})\s*-\s*([A-Z])\b/i.exec(t);
+  if (!m) return null;
+  const num = m[1].padStart(2, '0');
+  const letter = (m[2] || '').toUpperCase();
+  return `${num}-${letter}`;
+}
+
+function extractDptoFromUnidadLike_(ocrText) {
+  const t = (ocrText || '').toString();
+  if (!t) return null;
+  // "Unidad: 02-C" | "Unidad: 2C" | "Unidad: 2/C" | "UF: 02-C"
+  let m = /\b(?:unidad(?:\s*funcional)?|uf)\b\s*:\s*0*([0-9]{1,3})\s*[-\/]?\s*([A-Z])\b/i.exec(t);
+  if (!m) m = /\b(?:unidad(?:\s*funcional)?|uf)\b\s*:\s*0*([0-9]{1,3})\s*\/\s*([A-Z])\b/i.exec(t);
+  if (!m) return null;
+  const num = String(m[1] || '').padStart(2, '0');
+  const letter = (m[2] || '').toUpperCase();
+  if (!num || !letter) return null;
+  return `${num}-${letter}`;
+}
+
+function extractUfFromOcr_(ocrText) {
+  const t = (ocrText || '').toString();
+  if (!t) return null;
+  // "Unidad: 0035" | "Unidad Funcional: 35" | "UF: 0035"
+  const m = /\b(?:unidad(?:\s*funcional)?|uf)\b\s*:\s*([0-9]{2,6})\b/i.exec(t);
+  if (!m) return null;
+  const v = (m[1] || '').trim();
+  // Si el valor tiene letra, no es UF numérica
+  if (/[A-Z]/i.test(v)) return null;
+  return v;
 }
 
 function parseAmount_(value) {
@@ -176,6 +905,11 @@ function ocrBlobViaDrive_(blob, filename, ocrLanguage) {
   if (!canUseDriveOcr_()) {
     throw new Error('Drive API no habilitada (Advanced Service: Drive)');
   }
+  if (OCR_CALLS_RUN >= OCR_CONFIG.MAX_OCR_CALLS_PER_RUN) {
+    throw new Error('OCR_BUDGET_EXCEEDED');
+  }
+  // Contar el intento (aunque falle) para respetar presupuesto y evitar loops
+  OCR_CALLS_RUN++;
 
   const tempFile = DriveApp.createFile(blob.setName(filename));
   let docId = null;
@@ -185,10 +919,12 @@ function ocrBlobViaDrive_(blob, filename, ocrLanguage) {
       title: filename,
       mimeType: 'application/vnd.google-apps.document'
     };
-    const docFile = Drive.Files.copy(resource, tempFile.getId(), {
-      ocr: true,
-      ocrLanguage: ocrLanguage || 'es'
-    });
+    const docFile = withBackoff_(function() {
+      return Drive.Files.copy(resource, tempFile.getId(), {
+        ocr: true,
+        ocrLanguage: ocrLanguage || 'es'
+      });
+    }, 6);
     docId = docFile && docFile.id ? docFile.id : null;
     if (!docId) {
       throw new Error('No se pudo crear el documento OCR');
@@ -471,6 +1207,21 @@ const PALABRAS_EXCLUSION_FUERTE = [
 
 const REGEX_RESUMEN_PROCESAMIENTO = /^resumen\s+procesamiento\s+expensas\s+-\s+\d{2}\/\d{2}\/\d{4}$/i;
 
+// Conceptos típicos de transferencias que NO corresponden a expensas (falsos positivos frecuentes)
+// Criterio: pagos de sueldos/aguinaldo/haberes/nómina, aunque venga "consorcio" o dirección.
+const CONCEPTOS_NO_EXPENSA = [
+  'sac',
+  'aguinaldo',
+  'sueldo',
+  'sueldos',
+  'haberes',
+  'nomina',
+  'nómina',
+  'liquidacion',
+  'liquidación',
+  'payroll'
+];
+
 // ==================== PROMPT DE VALIDACIÓN LLM ====================
 const VALIDATION_PROMPT = `Tu tarea: entender la INTENCIÓN del email.
 Clasifica el email en 3 estados:
@@ -493,6 +1244,7 @@ ACEPTAR si ves intención de pago:
 RECHAZAR solo si la intención NO es pago de expensas:
 - presupuesto/pintura/impermeabilización/reparación/proveedor/factura de servicio
 - cobranzas/deuda/saldo pendiente/recordatorio de pago
+- transferencias cuyo Referencia/Motivo/Concepto sea SAC/aguinaldo/sueldo/haberes/nómina
 - recibo/cuota/inscripción/pago a una entidad (ej: Cámara) que no sea expensas del consorcio
 - reclamos/avisos (p.ej. "se encuentra esto en la cochera") sin pago
 
@@ -603,7 +1355,9 @@ function extractDataWithAI(subject, body) {
   const prompt = `Extrae la siguiente informacion de este email de pago de expensas.
 Responde UNICAMENTE con un JSON valido, sin explicaciones ni texto adicional.
 
-Nota: el cuerpo puede incluir una sección "=== OCR (adjuntos/imagenes) ===" con texto extraído por OCR.
+Nota: el input incluye EMAIL (asunto/cuerpo) y OCR (texto del comprobante/imagen).
+HINTS_JSON y OCR_EVIDENCE son sugerencias/recortes y pueden estar incompletos o equivocados.
+Usa el mejor dato disponible por consistencia con el campo pedido.
 
 Campos a extraer:
 - monto: numero sin simbolo $ (ejemplo: 164185.30). Si hay múltiples comprobantes, usa monto_total como principal. Si no encuentras monto, usa null.
@@ -617,13 +1371,16 @@ Campos a extraer:
   - Normalizar siempre a "Piso X Dpto Y" cuando haya piso y número de departamento separados.
   - Normalizar siempre a "Cochera X" o "Cocheras X y Y" cuando se mencionen cocheras.
   Si no hay información de departamento/unidad, usa null.
+- uf: unidad funcional / unidad (identificador). Regla:
+  - Si el texto dice "Unidad:"/"Unidad Funcional:"/"UF:" seguido solo de un número (ej "0035"), eso corresponde a uf.
+  - Si dice "Unidad:" con número y letra (ej "02-C", "2C", "2/C"), eso corresponde a dpto (normalizar a "02-C") y uf debe ser null (salvo que haya un uf separado).
+  Si no hay UF/Unidad numérica, usa null.
 - estado: string en MAYUSCULAS (ej: "PENDIENTE", "APROBADO") si el email contiene un campo tipo "Estado: ...". Si no aparece, usa null. Si aparece "Estado: Pendiente", devuelve "PENDIENTE".
 - ed: direccion del edificio/consorcio (solo calle y numero, sin piso ni depto). Debe preservar numeración compuesta tipo "2647/51". Ejemplos: "Paraguay 2949", "Av Santa Fe 2647/51", "Araoz 380". Si no hay dirección, usa null.
 - pagador: nombre y apellido o razón social que figure como titular/emisor/ordenante del comprobante (si aparece). Si no hay, usa null.
 
-Email:
-Asunto: ${subject}
-Cuerpo: ${truncatedBody}
+Input:
+${truncatedBody}
 
 JSON:`;
 
@@ -631,6 +1388,238 @@ JSON:`;
   // Limpiar respuesta (a veces la IA agrega backticks de markdown)
   const cleanResponse = response.replace(/```json\n?|\n?```/g, '').trim();
   return JSON.parse(cleanResponse);
+}
+
+function buildPayerSpecialistPrompt_(subject, emailBody, ocrText) {
+  const emailBodyFull = truncateText_((emailBody || '').toString(), 6000);
+  const ocrFull = truncateText_((ocrText || '').toString(), 8000);
+  const ocrEvidence = buildOcrEvidence_(ocrFull, getOcrAnchors_(), 2, 2500);
+
+  return `Extrae el NOMBRE COMPLETO del PAGADOR (la persona que realiza/ordena la transferencia).
+NO es el beneficiario/destinatario/consorcio/administración. Buscamos al ORIGINANTE/ORDENANTE/TITULAR CUENTA DÉBITO.
+
+Si no hay evidencia clara del nombre del pagador, devuelve null.
+
+Devuelve SOLO este JSON válido (sin texto extra):
+{"pagador_full_name":string|null,"confidence":"high|medium|low","evidence":string|null}
+
+Reglas:
+- "evidence" debe ser una cita EXACTA (substring) del input donde aparece el nombre.
+- No inventes nombres.
+- No uses nombres de consorcios ("CONS PROP...", "CONSORCIO...", "ADM...") como pagador.
+
+Ejemplos:
+
+INPUT:
+EMAIL_SUBJECT: Aviso de transferencia
+EMAIL_BODY_FULL:
+(vacío)
+OCR_FULL:
+Comprobante de transferencia
+Importe: $ 65.199,02
+De: Cecilia Deyheralde
+Para: Cons Prop Av Santa Fe 2647 51
+Motivo: Varios
+OUTPUT:
+{"pagador_full_name":"Cecilia Deyheralde","confidence":"high","evidence":"De: Cecilia Deyheralde"}
+
+INPUT:
+EMAIL_SUBJECT: Comprobante de Transferencia
+EMAIL_BODY_FULL:
+(vacío)
+OCR_FULL:
+BancoCiudad
+Importe $ 215.201,03
+Destino CONS D PR LM DRAGO 436
+Motivo Expensas
+Originante CARMEN GRACIELA BURDET
+OUTPUT:
+{"pagador_full_name":"CARMEN GRACIELA BURDET","confidence":"high","evidence":"Originante CARMEN GRACIELA BURDET"}
+
+INPUT:
+EMAIL_SUBJECT: Transferencia
+EMAIL_BODY_FULL:
+Comparto el comprobante de transferencia de Peron 2250 / 4D
+Saludos Cordiales
+Silvana
+OCR_FULL:
+Transferencia
+Destinatario: CONS. DE PROP. PTE.
+Monto: $70.425,43
+Banco: BANCO PATAGONIA
+Motivo: Expensas
+OUTPUT:
+{"pagador_full_name":"Silvana","confidence":"medium","evidence":"Silvana"}
+
+INPUT:
+EMAIL_SUBJECT: Comprobante
+EMAIL_BODY_FULL:
+(vacío)
+OCR_FULL:
+Cuenta a debitar: CA - PESOS - 4463...
+Nombre Beneficiario: CONS PROPIET ARAOZ 378
+Importe: 109726.11
+OUTPUT:
+{"pagador_full_name":null,"confidence":"low","evidence":null}
+
+INPUT:
+EMAIL_SUBJECT: ${subject}
+EMAIL_BODY_FULL:
+${emailBodyFull}
+
+OCR_EVIDENCE:
+${ocrEvidence || '(vacío)'}
+
+OCR_FULL:
+${ocrFull}
+`;
+}
+
+function isLikelyPersonName_(name) {
+  const s = (name || '').toString().trim();
+  if (!s) return false;
+  if (/@/.test(s)) return false;
+  if (/\d/.test(s)) return false;
+  const n = normalizeForMatch_(s);
+  if (n.indexOf('consorcio') !== -1) return false;
+  if (n.indexOf('cons prop') !== -1) return false;
+  if (n.indexOf('cons. de prop') !== -1) return false;
+  if (n.indexOf('adm') === 0) return false;
+  return /[a-záéíóúñ]/i.test(s);
+}
+
+function extractPayerCandidates_(subject, emailBody, ocrText) {
+  const candidates = [];
+  const seen = {};
+
+  function addCandidate(name, evidence, source) {
+    const clean = normalizePayor_(name);
+    if (!clean || !isLikelyPersonName_(clean)) return;
+    const key = normalizeForMatch_(clean);
+    if (!key || seen[key]) return;
+    seen[key] = true;
+    candidates.push({ name: clean, evidence: (evidence || '').toString().trim(), source: source || 'unknown' });
+  }
+
+  const combined = `${subject || ''}\n${emailBody || ''}\n${ocrText || ''}`;
+  const lines = combined.split(/\r?\n/).map(function(l) { return (l || '').trim(); }).filter(Boolean);
+
+  // OCR/email labels típicos: "De:", "Originante", "Ordenante", "Titular", "Titular cuenta débito"
+  const labelPatterns = [
+    /\bDe\s*:\s*([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s.'-]{2,80})/i,
+    /\bOriginante\b[:\s]+([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s.'-]{2,80})/i,
+    /\bOrdenante\b[:\s]+([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s.'-]{2,80})/i,
+    /\bTitular(?:\s+cuenta\s+d[eé]bito)?\b[:\s]+([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s.'-]{2,80})/i,
+    /\bCuenta\s+d[eé]bito\b[:\s]+([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s.'-]{2,80})/i
+  ];
+
+  for (var i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    for (var j = 0; j < labelPatterns.length; j++) {
+      const m = labelPatterns[j].exec(line);
+      if (m && m[1]) addCandidate(m[1], line, 'labeled');
+    }
+  }
+
+  // Firma simple en email: si termina con "Saludos" o "Saludos Cordiales", tomar la siguiente línea como candidato
+  for (var k = 0; k < lines.length - 1; k++) {
+    const ln = normalizeForMatch_(lines[k]);
+    if (ln === 'saludos' || ln === 'saludos cordiales' || ln === 'cordialmente') {
+      const next = lines[k + 1];
+      // Evitar frases largas y palabras típicas de firmas
+      if (next && next.length <= 40 && !/administraci|consorcio|cons prop|banco|cbu|cuit|cuil/i.test(next)) {
+        addCandidate(next, next, 'email_signature');
+      }
+    }
+  }
+
+  return candidates;
+}
+
+function buildPayerSelectorPrompt_(subject, emailBody, ocrText, candidates) {
+  const emailBodyFull = truncateText_((emailBody || '').toString(), 4000);
+  const ocrFull = truncateText_((ocrText || '').toString(), 5000);
+  const ocrEvidence = buildOcrEvidence_(ocrFull, getOcrAnchors_(), 2, 2000);
+  const candJson = JSON.stringify((candidates || []).map(function(c, idx) {
+    return { index: idx, name: c.name, source: c.source, evidence: c.evidence };
+  }));
+
+  return `Elegí el PAGADOR correcto (persona que realiza/ordena la transferencia) entre los CANDIDATOS.
+NO es el beneficiario/destinatario/consorcio/administración. Si ninguno es claramente el pagador, devolvé null.
+
+Devuelve SOLO este JSON válido:
+{"selected_index":number|null,"confidence":"high|medium|low","reason":"texto breve"}
+
+Reglas:
+- selected_index debe ser un número entero válido del listado o null.
+- Preferí candidatos con evidencia rotulada (De/Originante/Ordenante/Titular cuenta débito).
+- No elijas nombres de consorcios/administración.
+
+Ejemplo 1:
+CANDIDATOS:
+[{"index":0,"name":"Cecilia Deyheralde","source":"labeled","evidence":"De: Cecilia Deyheralde"},{"index":1,"name":"Cons Prop Av Santa Fe 2647 51","source":"labeled","evidence":"Para: Cons Prop Av Santa Fe 2647 51"}]
+OUTPUT:
+{"selected_index":0,"confidence":"high","reason":"Está rotulado como De/originante"}
+
+Ejemplo 2:
+CANDIDATOS:
+[{"index":0,"name":"CONS PROPIET ARAOZ 378","source":"labeled","evidence":"Nombre Beneficiario: CONS PROPIET ARAOZ 378"}]
+OUTPUT:
+{"selected_index":null,"confidence":"low","reason":"Solo aparece beneficiario/consorcio"}
+
+INPUT:
+EMAIL_SUBJECT: ${subject}
+EMAIL_BODY_FULL:
+${emailBodyFull}
+
+OCR_EVIDENCE:
+${ocrEvidence || '(vacío)'}
+
+OCR_FULL:
+${ocrFull}
+
+CANDIDATOS:
+${candJson}
+`;
+}
+
+function selectPayerFromCandidatesWithLLM_(subject, emailBody, ocrText, candidates) {
+  if (!candidates || candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0].name;
+  const prompt = buildPayerSelectorPrompt_(subject, emailBody, ocrText, candidates);
+  const response = callAI(prompt);
+  const cleanResponse = response.replace(/```json\n?|\n?```/g, '').trim();
+  const json = JSON.parse(cleanResponse);
+  if (json.selected_index == null || json.selected_index === '') return null;
+  const idx = Number(json.selected_index);
+  if (isNaN(idx) || idx < 0 || idx >= candidates.length) return null;
+  return candidates[idx].name;
+}
+
+function extractPayerWithLLMSpecialist_(subject, emailBody, ocrText) {
+  const prompt = buildPayerSpecialistPrompt_(subject, emailBody, ocrText);
+  const response = callAI(prompt);
+  const cleanResponse = response.replace(/```json\n?|\n?```/g, '').trim();
+  const json = JSON.parse(cleanResponse);
+  const payer = normalizePayor_(json.pagador_full_name);
+  const confidence = (json.confidence || '').toString().toLowerCase().trim();
+  const evidence = (json.evidence || '').toString();
+
+  const inputForEvidence = `${subject}\n${emailBody || ''}\n${ocrText || ''}`;
+  if (!payer || !isLikelyPersonName_(payer)) return { payer: null, confidence: confidence || 'low', evidence: null };
+  if (evidence && inputForEvidence.indexOf(evidence) === -1) {
+    return { payer: null, confidence: 'low', evidence: null };
+  }
+  return { payer: payer, confidence: confidence || 'medium', evidence: evidence || null };
+}
+
+function extractPayerWithCandidateSelector_(subject, emailBody, ocrText) {
+  const candidates = extractPayerCandidates_(subject, emailBody, ocrText);
+  const selected = selectPayerFromCandidatesWithLLM_(subject, emailBody, ocrText, candidates);
+  if (selected) return selected;
+  // Fallback: especialista "libre" con evidencia (por si no hubo candidatos claros)
+  const res = extractPayerWithLLMSpecialist_(subject, emailBody, ocrText);
+  return res && res.payer ? res.payer : null;
 }
 
 /**
@@ -642,17 +1631,33 @@ JSON:`;
  * @param {string} threadUrl - URL del thread en Gmail
  * @param {string} label - Texto visible del hyperlink
  */
-function saveToSheet(noticeDate, paymentDate, amount, building, apartment, threadUrl, label) {
+function buildObservacionesRichText_(threadUrl, label, highlightText, highlightColor) {
+  const linkLabel = (label || 'Abrir email').toString();
+  const prefix = highlightText ? (highlightText + ' | ') : '';
+  const full = prefix + linkLabel;
+
+  const builder = SpreadsheetApp.newRichTextValue().setText(full);
+  builder.setLinkUrl(prefix.length, full.length, threadUrl);
+
+  if (highlightText) {
+    const style = SpreadsheetApp.newTextStyle()
+      .setBold(true)
+      .setForegroundColor(highlightColor || '#3D85C6')
+      .build();
+    builder.setTextStyle(0, highlightText.length, style);
+  }
+
+  return builder.build();
+}
+
+function saveToSheet(noticeDate, paymentDate, amount, building, apartment, uf, highlightStatus, threadUrl, label) {
   const ss = SpreadsheetApp.openById(SHEET_CONFIG.SPREADSHEET_ID);
   const sheet = ss.getSheetByName(SHEET_CONFIG.SHEET_NAME);
   
   if (!sheet) {
     throw new Error(`No se encontró la hoja "${SHEET_CONFIG.SHEET_NAME}" en el spreadsheet`);
   }
-  const separator = getFormulaSeparator(ss.getSpreadsheetLocale());
-  const safeLabel = (label || '').replace(/"/g, '""');
-  const comment = `=HYPERLINK("${threadUrl}"${separator}"${safeLabel}")`;
-  log(`(Central) CREANDO OBSERVACIONES con separador "${separator}"`);
+  log(`(Central) CREANDO OBSERVACIONES con RichText`);
   
   // Columnas: TIPO AVISO | FECHA AVISO | FECHA DE PAGO | MONTO | ED | DPTO | UF | COMENTARIO
   const row = [
@@ -662,60 +1667,166 @@ function saveToSheet(noticeDate, paymentDate, amount, building, apartment, threa
     amount || '',           // MONTO
     building || '',         // ED
     apartment || '',        // DPTO
-    '',                     // UF (vacío por ahora)
-    comment || ''           // COMENTARIO / OBSERVACIONES
+    uf || '',               // UF
+    ''                      // COMENTARIO / OBSERVACIONES (se setea como RichText)
   ];
   
   sheet.appendRow(row);
   log(`(Central) Fila agregada al Sheet: ${JSON.stringify(row)}`);
+
+  const lastRow = sheet.getLastRow();
+  const rowRange = sheet.getRange(lastRow, 1, 1, row.length);
+  const commentCell = sheet.getRange(lastRow, 8);
+
+  let highlightText = '';
+  let highlightColor = '';
+  if (highlightStatus === 'missing_no_attachment') {
+    highlightText = 'NO SE DETECTO COMPROBANTE DE PAGO';
+    highlightColor = '#B45F06'; // amarillo oscuro legible
+    rowRange.setBackground('#FFF2CC'); // amarillo suave
+  } else if (highlightStatus === 'missing_with_attachment') {
+    highlightText = 'NO SE DETECTO COMPROBANTE DE PAGO | SE DETECTO UN ARCHIVO';
+    highlightColor = '#3D85C6'; // celeste
+    rowRange.setBackground('#D9EAF7'); // celeste suave
+  } else if (highlightStatus === 'ok') {
+    // sin resaltado
+  }
+
+  commentCell.setRichTextValue(buildObservacionesRichText_(threadUrl, label, highlightText, highlightColor));
 }
 
 // ==================== FUNCIONES PRINCIPALES ====================
 
 function procesarEmailsExpensas() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(25000)) {
+    log('=== SKIP: otro proceso está corriendo ===');
+    return;
+  }
+  OCR_CALLS_RUN = 0;
   log('=== Iniciando procesamiento de emails (casilla central) ===');
   let totalProcesados = 0;
   let totalMarcados = 0;
   let totalErrores = 0;
+  let needRerun = false;
+  let rerunDelayMs = 0;
 
-  CONFIG.EMAILS_ORIGEN.forEach(emailOrigen => {
-    try {
-      const resultado = procesarEmailsDeCuenta(emailOrigen);
-      totalProcesados += resultado.procesados;
-      totalMarcados += resultado.reenviados; // aquí reenviados = marcados
-      totalErrores += resultado.errores;
-    } catch (e) {
-      log(`Error procesando ${emailOrigen}: ${e.toString()}`);
-      totalErrores++;
+  try {
+    for (var i = 0; i < CONFIG.EMAILS_ORIGEN.length; i++) {
+      const emailOrigen = CONFIG.EMAILS_ORIGEN[i];
+      try {
+        const resultado = procesarEmailsDeCuenta(emailOrigen);
+        totalProcesados += resultado.procesados;
+        totalMarcados += resultado.reenviados; // aquí reenviados = marcados
+        totalErrores += resultado.errores;
+        if (resultado.needRerun) {
+          needRerun = true;
+          rerunDelayMs = Math.max(rerunDelayMs, resultado.rerunDelayMs || 0);
+        }
+        if (resultado.stopRun) {
+          log('=== STOP: se retoma en próxima corrida ===');
+          break;
+        }
+      } catch (e) {
+        log(`Error procesando ${emailOrigen}: ${e.toString()}`);
+        totalErrores++;
+      }
     }
-  });
-
-  log(`=== Resumen central: ${totalProcesados} procesados, ${totalMarcados} marcados, ${totalErrores} errores ===`);
+    log(`=== Resumen central: ${totalProcesados} procesados, ${totalMarcados} marcados, ${totalErrores} errores ===`);
+    if (needRerun) {
+      scheduleRerun_(rerunDelayMs || 2 * 60 * 1000);
+    }
+  } finally {
+    try { lock.releaseLock(); } catch (e2) {}
+  }
 }
 
 function procesarEmailsDeCuenta(emailOrigen) {
-  const stats = { procesados: 0, reenviados: 0, errores: 0 };
+  const stats = { procesados: 0, reenviados: 0, errores: 0, stopRun: false, needRerun: false, rerunDelayMs: 0 };
   try {
     const labelProcesadoName = getRequiredConfigString_(CONFIG.ETIQUETA_PROCESADO, 'ETIQUETA_PROCESADO');
     const labelDescartadoName = (CONFIG.ETIQUETA_DESCARTADO || 'ExpensaDescartada').toString().trim();
-    const query = `in:inbox -label:${labelProcesadoName} -label:${labelDescartadoName} newer_than:1d`;
-    const threads = GmailApp.search(query, 0, 50);
-    log(`(Central) Threads nuevos: ${threads.length}`);
+    const labelEnProcesoName = (CONFIG.ETIQUETA_EN_PROCESO || 'ExpensaEnProceso').toString().trim();
+    const labelRequiereRevisionName = (CONFIG.ETIQUETA_REQUIERE_REVISION || 'REQUIERE REVISION').toString().trim();
+    const days = Number(CONFIG.DIAS_BUSQUEDA || 1);
+
+    const queryEnProceso = `in:anywhere label:${escapeLabelForQuery_(labelEnProcesoName)} -label:${escapeLabelForQuery_(labelProcesadoName)} -label:${escapeLabelForQuery_(labelDescartadoName)} -label:${escapeLabelForQuery_(labelRequiereRevisionName)}`;
+    const threadsEnProceso = GmailApp.search(queryEnProceso, 0, CONFIG.MAX_THREADS_PER_RUN);
+
+    const queryNuevos = `in:inbox -label:${escapeLabelForQuery_(labelProcesadoName)} -label:${escapeLabelForQuery_(labelDescartadoName)} -label:${escapeLabelForQuery_(labelEnProcesoName)} -label:${escapeLabelForQuery_(labelRequiereRevisionName)} newer_than:${days}d`;
+    const threadsNuevos = GmailApp.search(queryNuevos, 0, 100);
+
+    const byId = {};
+    const threads = [];
+    for (var i = 0; i < threadsEnProceso.length; i++) {
+      const t1 = threadsEnProceso[i];
+      const id1 = t1.getId();
+      if (byId[id1]) continue;
+      byId[id1] = true;
+      threads.push(t1);
+    }
+    for (var j = 0; j < threadsNuevos.length; j++) {
+      const t2 = threadsNuevos[j];
+      const id2 = t2.getId();
+      if (byId[id2]) continue;
+      byId[id2] = true;
+      threads.push(t2);
+    }
+
+    const batch = threads.slice(0, CONFIG.MAX_THREADS_PER_RUN);
+    log(`(Central) Threads en proceso: ${threadsEnProceso.length}, nuevos: ${threadsNuevos.length}, procesando: ${batch.length}`);
+    if (threadsEnProceso.length > 0 || threadsNuevos.length > CONFIG.MAX_THREADS_PER_RUN) {
+      stats.needRerun = true;
+      stats.rerunDelayMs = Math.max(stats.rerunDelayMs, 2 * 60 * 1000);
+    }
 
     const etiqueta = crearObtenerEtiqueta(labelProcesadoName);
     const etiquetaDescartado = crearObtenerEtiqueta(labelDescartadoName);
+    const etiquetaEnProceso = crearObtenerEtiqueta(labelEnProcesoName);
+    const etiquetaRequiereRevision = crearObtenerEtiqueta(labelRequiereRevisionName);
 
-    threads.forEach(thread => {
-      const threadUrl = `https://mail.google.com/mail/u/0/#all/${thread.getId()}`;
+    let totalMessagesRun = 0;
+    for (var ti = 0; ti < batch.length; ti++) {
+      const thread = batch[ti];
+      const threadId = thread.getId();
+      const threadUrl = `https://mail.google.com/mail/u/0/#all/${threadId}`;
       try {
+        if (totalMessagesRun >= CONFIG.MAX_TOTAL_MESSAGES_PER_RUN) {
+          log('(Central) STOP: MAX_TOTAL_MESSAGES_PER_RUN alcanzado');
+          return stats;
+        }
+
+        // Lease + EnProceso (checkpoint)
+        const isStale = isThreadLeaseStale_(threadId, OCR_CONFIG.STALE_EN_PROCESO_HOURS);
+        if (isStale) {
+          log(`(Central) Lease stale/empty, retomando: ${threadId}`);
+        }
+        thread.addLabel(etiquetaEnProceso);
+        setThreadLease_(threadId, new Date());
+
         const messages = thread.getMessages();
-        messages.forEach(message => {
+        const maxMessages = Math.min(messages.length, CONFIG.MAX_MESSAGES_PER_THREAD);
+        let threadFinalized = false;
+
+        for (var mi = 0; mi < maxMessages; mi++) {
+          const message = messages[mi];
           stats.procesados++;
+          totalMessagesRun++;
+        if (totalMessagesRun > CONFIG.MAX_TOTAL_MESSAGES_PER_RUN) {
+          log('(Central) STOP: MAX_TOTAL_MESSAGES_PER_RUN alcanzado');
+          stats.needRerun = true;
+          stats.rerunDelayMs = Math.max(stats.rerunDelayMs, 2 * 60 * 1000);
+          return stats;
+        }
+
           const subjectPre = message.getSubject() || '';
           if (REGEX_RESUMEN_PROCESAMIENTO.test(subjectPre.trim())) {
             log(`(Central) SKIP resumen: ${subjectPre}`);
             thread.addLabel(etiquetaDescartado);
-            return;
+            thread.removeLabel(etiquetaEnProceso);
+            clearThreadLease_(threadId);
+            threadFinalized = true;
+            break;
           }
           if (esComprobanteExpensa(message)) {
             log(`(Central) ✓ Expensa detectada por keywords: ${message.getSubject()}`);
@@ -723,12 +1834,24 @@ function procesarEmailsDeCuenta(emailOrigen) {
             const subject = message.getSubject();
             const body = message.getPlainBody();
             const hasAttachments = message.getAttachments({ includeInlineImages: false }).length > 0;
+            const hasInlineImagesOrAttachments = message.getAttachments({ includeInlineImages: true }).length > 0;
 
             // Señal simple de "pago claro" (para debugging)
             const texto = `${subject} ${body}`.toLowerCase();
             const pagoClaro = /transferenc|recibiste un pago|pago fue exitoso|se acredit|realizaste/.test(texto) &&
               (/(?:\$\s*)?\d{1,3}(?:[\.\s]\d{3})+(?:,\d{2})?|\$\s*\d{4,}/.test(texto) || /\b(cbu|cvu|alias|nro|número)\b/.test(texto));
             
+            // Regla: ignorar transferencias salientes realizadas por CARLOS ARTUSO.
+            // Importante: NO descartar transferencias entrantes aunque aparezca su nombre.
+            if (shouldDiscardOutgoingCarlosArtuso_(subject, body)) {
+              log(`(Central) DESCARTADO: transferencia saliente de Carlos Artuso | ${subject}`);
+              thread.addLabel(etiquetaDescartado);
+              thread.removeLabel(etiquetaEnProceso);
+              clearThreadLease_(threadId);
+              threadFinalized = true;
+              break;
+            }
+
             // PASO 0: OCR (solo si parece necesario)
             // - Adjuntos, cuerpo vacío/escaso, o el texto sugiere que "va adjunto".
             let ocrText = '';
@@ -736,7 +1859,8 @@ function procesarEmailsDeCuenta(emailOrigen) {
             const textSuggestsAttachment = /\badjunt|ver\s+archivo|comprobante\s+adjunto|imagen\s+adjunta/i.test(body || '') ||
               /\badjunt|ver\s+archivo|comprobante\s+adjunto|imagen\s+adjunta/i.test(subject || '');
 
-            if (OCR_CONFIG.ENABLED && (hasAttachments || bodyLooksEmpty || textSuggestsAttachment)) {
+            // Si hay adjuntos/inline, necesitamos OCR para distinguir "comprobante" vs "archivo adjunto".
+            if (OCR_CONFIG.ENABLED && (hasInlineImagesOrAttachments || bodyLooksEmpty || textSuggestsAttachment)) {
               const ocrAdj = extraerTextoDeAdjuntosExpensa(message);
               const ocrInline = extraerTextoDeImagenesEnCuerpo(message);
               ocrText = [ocrAdj, ocrInline].filter(Boolean).join('\n\n');
@@ -746,6 +1870,11 @@ function procesarEmailsDeCuenta(emailOrigen) {
             }
             const bodyForAI = composeBodyWithOcr_(body, ocrText);
             const fullTextForRules = `${subject}\n${bodyForAI}`;
+            const hasComprobante = hasInlineImagesOrAttachments && detectReceiptLikeOcr_(ocrText);
+            // Estado único (opción 2): OK vs falta comprobante (con o sin archivo)
+            const highlightStatus = hasComprobante
+              ? 'ok'
+              : (hasInlineImagesOrAttachments ? 'missing_with_attachment' : 'missing_no_attachment');
 
             // Excluir por texto completo (incluye OCR) para frenar falsos positivos de adjuntos
             const textoCompletoLower = fullTextForRules.toLowerCase();
@@ -753,7 +1882,21 @@ function procesarEmailsDeCuenta(emailOrigen) {
             if (tieneExclusionFuerte) {
               log(`(Central) DESCARTADO por exclusión fuerte: ${subject}`);
               thread.addLabel(etiquetaDescartado);
-              return;
+              thread.removeLabel(etiquetaEnProceso);
+              clearThreadLease_(threadId);
+              threadFinalized = true;
+              break;
+            }
+
+            // Regla determinística: transferencias con Referencia/Motivo/Concepto no-expensa (ej: SAC)
+            const nonExpenseConcept = matchesNonExpenseConcept_(fullTextForRules);
+            if (nonExpenseConcept) {
+              log(`(Central) DESCARTADO por concepto no-expensa: ${nonExpenseConcept} | ${subject}`);
+              thread.addLabel(etiquetaDescartado);
+              thread.removeLabel(etiquetaEnProceso);
+              clearThreadLease_(threadId);
+              threadFinalized = true;
+              break;
             }
 
             // PASO 1: Validar con LLM (fail-open con 3 estados)
@@ -767,7 +1910,10 @@ function procesarEmailsDeCuenta(emailOrigen) {
               log(`(Central) ✗ LLM rejected: ${subject} | Reason: ${validation.reviewReason || 'LLM_REJECT'}`);
               // No etiquetar como expensa - evitar re-procesamiento
               thread.addLabel(etiquetaDescartado);
-              return;
+              thread.removeLabel(etiquetaEnProceso);
+              clearThreadLease_(threadId);
+              threadFinalized = true;
+              break;
             }
             // Nota: si el LLM está en "review", dejamos pasar y lo marcamos en observaciones.
             
@@ -779,15 +1925,80 @@ function procesarEmailsDeCuenta(emailOrigen) {
                 'dd-MM-yy'
               );
               
-              const extractedData = extractDataWithAI(subject, bodyForAI);
+              const ocrOnly = getOcrSection_(bodyForAI);
+              const extractorContext = buildExtractorContext_(subject, body, ocrText);
+              const extractedData = extractDataWithAI(subject, extractorContext);
               const estado = (extractedData.estado || '').toString().trim().toUpperCase();
 
-              // Dirección con "/" (ej: 2647/51): preferir heurística si el LLM la truncó
+              const qaTags = [];
+              const currentEd2 = (extractedData.ed || '').toString();
+              const currentDpto2 = (extractedData.dpto || '').toString().trim();
+
+              // Auditoría (no corrige): sugerencias desde email + OCR
+              const emailEd = extractEdFromEmailText_(fullTextForRules);
+              const emailDpto = extractDptoFromEmailText_(fullTextForRules);
+              const emailDptoNorm = normalizeDpto_(emailDpto);
+              const currentDptoNorm = normalizeDpto_(currentDpto2);
+              if (emailEd && normalizeForMatch_(emailEd) !== normalizeForMatch_(currentEd2)) {
+                qaTags.push(`SUG_ED_EMAIL=${truncateText_(emailEd, 45)}`);
+              }
+              if (emailDptoNorm && normalizeForMatch_(emailDptoNorm) !== normalizeForMatch_(currentDptoNorm || '')) {
+                qaTags.push(`SUG_DPTO_EMAIL=${truncateText_(emailDptoNorm, 20)}`);
+              }
+
+              if (isIgnoredEd_(currentEd2)) qaTags.push('WARN_ED_ADMIN_ADDR');
+
+              // Direcciones con "/" en el texto: sugerir si el LLM no preservó
               const slashAddress = extractSlashAddress_(fullTextForRules);
               if (slashAddress) {
-                const currentEd = (extractedData.ed || '').toString();
-                const hasSlash = /\d+\s*\/\s*\d+/.test(currentEd);
-                if (!hasSlash) extractedData.ed = slashAddress;
+                const hasSlash = /\d+\s*\/\s*\d+/.test(currentEd2);
+                if (!hasSlash) qaTags.push(`SUG_ED_SLASH=${truncateText_(slashAddress, 45)}`);
+              }
+
+              if (ocrOnly) {
+                const edFromOcr = extractEdFromOcr_(ocrOnly);
+                if (edFromOcr && normalizeForMatch_(edFromOcr) !== normalizeForMatch_(currentEd2)) {
+                  qaTags.push(`SUG_ED_OCR=${truncateText_(edFromOcr, 45)}`);
+                }
+                const dptoFromOcr = extractDeptoFromOcr_(ocrOnly) || extractDptoFromUnidadLike_(ocrOnly);
+                const dptoFromOcrNorm = normalizeDpto_(dptoFromOcr);
+                if (dptoFromOcrNorm && normalizeForMatch_(dptoFromOcrNorm) !== normalizeForMatch_(currentDptoNorm || '')) {
+                  qaTags.push(`SUG_DPTO_OCR=${truncateText_(dptoFromOcrNorm, 20)}`);
+                  if (currentDptoNorm) qaTags.push(`WARN_DPTO_LLM=${truncateText_(currentDptoNorm, 20)}`);
+                  // Corrección de alta confianza si viene rotulado como Depto o Unidad con letra
+                  extractedData.dpto = dptoFromOcrNorm;
+                  qaTags.push('FIX_DPTO_OCR');
+                }
+
+                const ufFromOcr = extractUfFromOcr_(ocrOnly);
+                if (ufFromOcr) {
+                  const currentUf = (extractedData.uf || '').toString().trim();
+                  if (!currentUf) {
+                    extractedData.uf = ufFromOcr;
+                    qaTags.push(`SUG_UF_OCR=${ufFromOcr}`);
+                    qaTags.push('FIX_UF_OCR');
+                  } else if (normalizeForMatch_(currentUf) !== normalizeForMatch_(ufFromOcr)) {
+                    qaTags.push(`SUG_UF_OCR=${ufFromOcr}`);
+                    qaTags.push(`WARN_UF_LLM=${truncateText_(currentUf, 20)}`);
+                  }
+                }
+              }
+
+              // Si el LLM puso UF numérica en DPTO, mover a UF (alta confianza)
+              const dptoNumericOnly = /^[0-9]{2,6}$/.test((extractedData.dpto || '').toString().trim());
+              if (dptoNumericOnly && !extractedData.uf) {
+                extractedData.uf = (extractedData.dpto || '').toString().trim();
+                extractedData.dpto = null;
+                qaTags.push('FIX_DPTO_TO_UF');
+              }
+
+              // Normalización final de DPTO (ej: 04-C -> Piso 4 Dpto C)
+              if (extractedData.dpto) {
+                const normalizedFinalDpto = normalizeDpto_(extractedData.dpto);
+                if (normalizedFinalDpto && normalizedFinalDpto !== extractedData.dpto) {
+                  extractedData.dpto = normalizedFinalDpto;
+                  qaTags.push('FIX_DPTO_NORM');
+                }
               }
 
               // Múltiples comprobantes: sumar montos si hay array
@@ -803,24 +2014,152 @@ function procesarEmailsDeCuenta(emailOrigen) {
                 }, 0);
                 if (sum > 0) amountToSave = sum;
               }
+              // Fallback determinístico: si el LLM no devolvió monto, usar OCR (líneas con "importe/monto/total").
+              if (amountToSave == null && ocrText) {
+                try {
+                  const ocrAmounts = extractMontosFromOcr_(ocrText);
+                  if (ocrAmounts && ocrAmounts.monto_total != null) {
+                    amountToSave = ocrAmounts.monto_total;
+                    qaTags.push('FIX_MONTO_OCR');
+                  } else if (ocrAmounts && ocrAmounts.montos && ocrAmounts.montos.length) {
+                    const maxAmt = Math.max.apply(null, ocrAmounts.montos);
+                    if (isFinite(maxAmt)) {
+                      amountToSave = maxAmt;
+                      qaTags.push('FIX_MONTO_OCR');
+                    }
+                  }
+                } catch (eAmt) {
+                  log(`(Central) Error monto OCR fallback: ${eAmt.toString()}`);
+                }
+              }
 
-              // ED incluye pagador si existe
-              const payor = normalizePayor_(extractedData.pagador);
-              const buildingBase = (extractedData.ed || '').toString().trim();
-              const buildingFinal = buildingBase && payor ? `${buildingBase} - ${payor}` : (buildingBase || null);
-              
+              // ED: si no hay dirección válida, fallback determinístico a "Pagador - CUIT/CUIL:.."
+              let buildingFinal = ((extractedData.ed || '') + '').toString().trim() || null;
+              let edFallbackApplied = false;
+              let edFallbackKind = '';
+
+              const hasValidEd = buildingFinal && isValidEd_(buildingFinal);
+              const emailEdCandidate = extractEdFromEmailText_(fullTextForRules);
+              const ocrEdCandidate = ocrOnly ? extractEdFromOcr_(ocrOnly) : null;
+              const hasAnyValidAddressCandidate = (emailEdCandidate && isValidEd_(emailEdCandidate)) || (ocrEdCandidate && isValidEd_(ocrEdCandidate));
+
+              if (!hasValidEd && !hasAnyValidAddressCandidate) {
+                const payerCuit = extractPayerCuitFromOcr_(ocrText);
+                if (payerCuit && payerCuit.name && payerCuit.cuit) {
+                  const payerName = payerCuit.name.trim();
+                  buildingFinal = `${payerName} - CUIT/CUIL:${payerCuit.cuit}`;
+                  edFallbackApplied = true;
+                  edFallbackKind = 'PAGADOR_CUIT';
+                  qaTags.push('FIX_ED_PAGADOR_CUIT');
+                }
+              }
+
+              // Si no hay dirección y no hubo CUIT/CUIL, fallback a pagador desde email/OCR (selector)
+              if (!hasValidEd && !hasAnyValidAddressCandidate && !edFallbackApplied) {
+                const payerFromExtracted = normalizePayor_(extractedData.pagador);
+                let payerName2 = payerFromExtracted;
+                if (!payerName2) {
+                  try {
+                    payerName2 = extractPayerWithCandidateSelector_(subject, body, ocrText);
+                  } catch (ePay) {
+                    payerName2 = null;
+                  }
+                }
+                if (payerName2) {
+                  buildingFinal = payerName2;
+                  edFallbackApplied = true;
+                  edFallbackKind = 'PAGADOR';
+                  qaTags.push('FIX_ED_PAGADOR');
+                }
+              }
+
+              // Fallback 4B: firma del email
+              if (!hasValidEd && !hasAnyValidAddressCandidate && !edFallbackApplied) {
+                const sigName = extractSignatureNameCandidate_(body);
+                if (sigName) {
+                  buildingFinal = sigName;
+                  edFallbackApplied = true;
+                  edFallbackKind = 'FIRMA';
+                  qaTags.push('FIX_ED_FIRMA');
+                }
+              }
+
+              // Fallback 4A: Motivo/Detalle (OCR) si parece nombre de persona
+              if (!hasValidEd && !hasAnyValidAddressCandidate && !edFallbackApplied) {
+                const motivoName = extractMotivoDetalleNameFromOcr_(ocrText);
+                if (motivoName) {
+                  buildingFinal = motivoName;
+                  edFallbackApplied = true;
+                  edFallbackKind = 'MOTIVO';
+                  qaTags.push('FIX_ED_MOTIVO');
+                }
+              }
+
+              if (!edFallbackApplied && (!buildingFinal || !isValidEd_(buildingFinal))) {
+                qaTags.push('WARN_ED_INVALID');
+              }
+
+              // Si faltan datos críticos, no completar la fila: etiquetar para revisión humana y continuar
+              const missingMonto = (amountToSave == null || amountToSave === '');
+              const missingEd = (!buildingFinal || buildingFinal.toString().trim() === '');
+              if (missingMonto || missingEd) {
+                const reasons = [];
+                if (missingMonto) reasons.push('MONTO');
+                if (missingEd) reasons.push('ED');
+                log(`(Central) REQUIERE REVISION: faltante ${reasons.join(', ')} | ${subject}`);
+                thread.addLabel(etiquetaRequiereRevision);
+                thread.removeLabel(etiquetaEnProceso);
+                clearThreadLease_(threadId);
+                threadFinalized = true;
+                break;
+              }
+              if (edFallbackApplied && (edFallbackKind === 'PAGADOR' || edFallbackKind === 'PAGADOR_CUIT' || edFallbackKind === 'FIRMA' || edFallbackKind === 'MOTIVO')) {
+                qaTags.push('QA_ED_SIN_DIRECCION');
+              }
+              // Fallback para cocheras: si no hay dpto/uf y el texto menciona cocheras con número.
+              if (!extractedData.dpto && !extractedData.uf) {
+                const cocheraDpto = extractCocheraDptoFromText_(fullTextForRules);
+                if (cocheraDpto) {
+                  extractedData.dpto = cocheraDpto;
+                  qaTags.push('FIX_DPTO_COCHERA');
+                }
+              }
+
               const commentParts = [];
               if (validation.review) {
                 commentParts.push(`REVIEW: ${validation.reviewReason || 'LLM_UNCERTAIN'}`);
               }
+
+              // Si no hay DPTO ni UF, intentar extraer pagador (ayuda a revisión humana)
+              if (!extractedData.dpto && !extractedData.uf) {
+                let payerCandidate = normalizePayor_(extractedData.pagador);
+                if (!payerCandidate) {
+                  try {
+                    payerCandidate = extractPayerWithCandidateSelector_(subject, body, ocrText);
+                    if (payerCandidate) {
+                      commentParts.push(`PAGADOR: ${payerCandidate}`);
+                    }
+                  } catch (eP) {
+                    log(`(Central) Error LLM pagador: ${eP.toString()}`);
+                  }
+                } else {
+                  commentParts.push(`PAGADOR: ${payerCandidate}`);
+                }
+              }
+
               if (estado === 'PENDIENTE') {
                 commentParts.push('ESTADO: PENDIENTE');
               }
               if (montos && montos.length && montos.length > 1) {
                 commentParts.push(`MULTI: ${montos.length} comprobantes`);
               }
+              if (qaTags && qaTags.length) {
+                commentParts.push(`QA: ${qaTags.join(', ')}`);
+              }
               const labelSuffix = commentParts.length > 0 ? ` (${commentParts.join(' | ')})` : '';
               const rawLabel = `Abrir email${labelSuffix}`;
+
+              buildingFinal = normalizeEdForSheet_(buildingFinal);
               
               saveToSheet(
                 noticeDate, 
@@ -828,6 +2167,8 @@ function procesarEmailsDeCuenta(emailOrigen) {
                 amountToSave, 
                 buildingFinal,
                 extractedData.dpto,
+                extractedData.uf,
+                highlightStatus,
                 threadUrl,
                 rawLabel
               );
@@ -839,16 +2180,41 @@ function procesarEmailsDeCuenta(emailOrigen) {
             }
             
             thread.addLabel(etiqueta);
+            thread.removeLabel(etiquetaEnProceso);
+            clearThreadLease_(threadId);
             stats.reenviados++; // usamos este campo como "marcados"
+            threadFinalized = true;
+            break;
           } else {
             log(`(Central) ✗ NO es expensa (keywords): ${message.getSubject()}`);
           }
-        });
+        }
+
+        // Si no se finalizó, liberar lease para que no quede colgado
+        if (!threadFinalized) {
+          thread.removeLabel(etiquetaEnProceso);
+          clearThreadLease_(threadId);
+        }
       } catch (e) {
+        const msg = (e && (e.message || e.toString())) ? (e.message || e.toString()) : '';
+        if (msg.indexOf('OCR_BUDGET_EXCEEDED') !== -1) {
+          log('(Central) STOP: OCR_BUDGET_EXCEEDED, se retoma en próxima corrida');
+          stats.stopRun = true;
+          stats.needRerun = true;
+          stats.rerunDelayMs = Math.max(stats.rerunDelayMs, 12 * 60 * 1000);
+          return stats;
+        }
+        if (isRateLimitError_(e)) {
+          log('(Central) STOP: rate limit Drive, se retoma en próxima corrida');
+          stats.stopRun = true;
+          stats.needRerun = true;
+          stats.rerunDelayMs = Math.max(stats.rerunDelayMs, 12 * 60 * 1000);
+          return stats;
+        }
         log(`(Central) Error en thread: ${e.toString()}`);
         stats.errores++;
       }
-    });
+    }
   } catch (e) {
     log(`(Central) Error buscando emails: ${e.toString()}`);
     stats.errores++;
@@ -1112,13 +2478,14 @@ function testAIExtraction() {
       const ocrInline = extraerTextoDeImagenesEnCuerpo(message);
       const ocrText = [ocrAdj, ocrInline].filter(Boolean).join('\n\n');
       const bodyForAI = composeBodyWithOcr_(body, ocrText);
+      const extractorContext = buildExtractorContext_(subject, body, ocrText);
       
       log(`--- Email ${index + 1}: ${subject} ---`);
       
       try {
         const validation = validateExpensePaymentWithLLM(subject, bodyForAI);
         log(`Validador: decision=${validation.isValid ? (validation.review ? 'ACCEPT_WITH_REVIEW' : 'ACCEPT') : 'REJECT'} | review=${validation.review ? (validation.reviewReason || 'LLM_UNCERTAIN') : 'none'}`);
-        const extractedData = extractDataWithAI(subject, bodyForAI);
+        const extractedData = extractDataWithAI(subject, extractorContext);
         log(`Monto: ${extractedData.monto}`);
         log(`Fecha pago: ${extractedData.fecha_pago}`);
         log(`Departamento: ${extractedData.dpto}`);

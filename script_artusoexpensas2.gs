@@ -286,6 +286,15 @@ function extractDptoFromEmailText_(text) {
   if (m && m[1]) return m[1].replace(/\s+/g, '').toUpperCase();
   m = /\b(?:dpto|depto|dto)\s*[:\-]?\s*([0-9]{1,2}\s*[A-Z])\b/i.exec(t);
   if (m && m[1]) return m[1].replace(/\s+/g, '').toUpperCase();
+
+  // Caso común en asuntos: "pago expensas 8 E [apellido]"
+  // Solo aplicar si hay contexto de expensas para evitar capturas accidentales.
+  const tn = normalizeForMatch_(t);
+  if (tn && (tn.indexOf('expensa') !== -1 || tn.indexOf('expensas') !== -1)) {
+    m = /\bexpensas?\b[^\n]{0,30}\b0*([0-9]{1,2})\s*([a-z])\b/i.exec(t);
+    if (m && m[1] && m[2]) return (String(parseInt(m[1], 10)) + String(m[2]).toUpperCase()).replace(/\s+/g, '');
+  }
+
   return null;
 }
 
@@ -433,6 +442,32 @@ function extractForwardedOriginalBody_(plainBody) {
   const idx = body.indexOf(marker);
   if (idx === -1) return body;
   return body.substring(idx + marker.length);
+}
+
+function extractForwardedSenderName_(plainBody) {
+  const body = (plainBody || '').toString();
+  if (!body) return null;
+
+  // Buscar en el wrapper del reenvío, antes del "contenido original".
+  const beforeOriginal = body.split('--- CONTENIDO ORIGINAL ---')[0] || '';
+  const lines = beforeOriginal.split(/\r?\n/).map(function(l) { return (l || '').trim(); }).filter(Boolean);
+
+  // Ej: "Este email fue reenviado automáticamente desde: Diego ... <mail@...>"
+  for (var i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const ln = normalizeForMatch_(line);
+    if (!ln) continue;
+    if (ln.indexOf('reenviado') === -1 || ln.indexOf('desde') === -1) continue;
+
+    const idx = line.indexOf(':');
+    const after = idx !== -1 ? line.substring(idx + 1) : line;
+    const withoutEmail = after.replace(/<[^>]+>/g, ' ').replace(/\([^)]+\)/g, ' ');
+    const cleaned = normalizePayor_(withoutEmail) || withoutEmail;
+    const candidate = (cleaned || '').replace(/\s+/g, ' ').trim();
+    if (candidate && isLikelyHumanNameForEdFallback_(candidate)) return candidate;
+  }
+
+  return null;
 }
 
 function extractSignatureNameCandidate_(plainBody) {
@@ -1939,6 +1974,10 @@ function procesarEmailsDeCuenta(emailOrigen) {
               const emailDpto = extractDptoFromEmailText_(fullTextForRules);
               const emailDptoNorm = normalizeDpto_(emailDpto);
               const currentDptoNorm = normalizeDpto_(currentDpto2);
+              if (!extractedData.dpto && emailDptoNorm) {
+                extractedData.dpto = emailDptoNorm;
+                qaTags.push('FIX_DPTO_EMAIL');
+              }
               if (emailEd && normalizeForMatch_(emailEd) !== normalizeForMatch_(currentEd2)) {
                 qaTags.push(`SUG_ED_EMAIL=${truncateText_(emailEd, 45)}`);
               }
@@ -1998,6 +2037,15 @@ function procesarEmailsDeCuenta(emailOrigen) {
                 if (normalizedFinalDpto && normalizedFinalDpto !== extractedData.dpto) {
                   extractedData.dpto = normalizedFinalDpto;
                   qaTags.push('FIX_DPTO_NORM');
+                }
+              }
+
+              // Fallback determinístico de fecha de pago desde OCR si el LLM no la devolvió.
+              if (!extractedData.fecha_pago && ocrText) {
+                const fechaFromOcr = extractFechaFromOcr_(ocrText);
+                if (fechaFromOcr) {
+                  extractedData.fecha_pago = fechaFromOcr;
+                  qaTags.push('FIX_FECHA_OCR');
                 }
               }
 
@@ -2073,6 +2121,20 @@ function procesarEmailsDeCuenta(emailOrigen) {
                 }
               }
 
+              // Fallback 4C: nombre del remitente capturado por el wrapper de reenvío (casillas receptoras).
+              // Ej: "reenviado automáticamente desde: Diego German Scandolo ..."
+              if (!hasValidEd && !hasAnyValidAddressCandidate && !edFallbackApplied) {
+                const forwardedName = extractForwardedSenderName_(body);
+                if (forwardedName) {
+                  const parts = forwardedName.split(' ').filter(Boolean);
+                  const last = parts.length ? parts[parts.length - 1] : '';
+                  buildingFinal = (last && last.length >= 3) ? last : forwardedName;
+                  edFallbackApplied = true;
+                  edFallbackKind = 'REENVIO';
+                  qaTags.push('FIX_ED_REENVIO');
+                }
+              }
+
               // Fallback 4B: firma del email
               if (!hasValidEd && !hasAnyValidAddressCandidate && !edFallbackApplied) {
                 const sigName = extractSignatureNameCandidate_(body);
@@ -2113,7 +2175,7 @@ function procesarEmailsDeCuenta(emailOrigen) {
                 threadFinalized = true;
                 break;
               }
-              if (edFallbackApplied && (edFallbackKind === 'PAGADOR' || edFallbackKind === 'PAGADOR_CUIT' || edFallbackKind === 'FIRMA' || edFallbackKind === 'MOTIVO')) {
+              if (edFallbackApplied && (edFallbackKind === 'PAGADOR' || edFallbackKind === 'PAGADOR_CUIT' || edFallbackKind === 'FIRMA' || edFallbackKind === 'MOTIVO' || edFallbackKind === 'REENVIO')) {
                 qaTags.push('QA_ED_SIN_DIRECCION');
               }
               // Fallback para cocheras: si no hay dpto/uf y el texto menciona cocheras con número.

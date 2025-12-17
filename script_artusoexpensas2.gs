@@ -595,6 +595,81 @@ function matchesNonExpenseConcept_(text) {
   return null;
 }
 
+function normalizeAccountName_(name) {
+  if (!name) return '';
+  return normalizeForMatch_(name).replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function isConsorcioLike_(value) {
+  const n = normalizeAccountName_(value);
+  if (!n) return false;
+  return (
+    n.indexOf('consorcio') !== -1 ||
+    n.indexOf('cons prop') !== -1 ||
+    n.indexOf('cons de prop') !== -1 ||
+    n.indexOf('propietarios') !== -1 ||
+    n.indexOf('consorcios') !== -1 ||
+    n.indexOf('cons.') !== -1 ||
+    n.indexOf('cons prop') !== -1
+  );
+}
+
+function isArtusoLike_(value) {
+  const n = normalizeAccountName_(value);
+  if (!n) return false;
+  return n.indexOf('artuso') !== -1;
+}
+
+function extractTitularesFromOcr_(ocrText) {
+  if (!ocrText) return { origen: null, destino: null };
+  const lines = (ocrText || '').split(/\r?\n/).map(function(l) { return (l || '').trim(); }).filter(Boolean);
+  let origen = null;
+  let destino = null;
+
+  const labelPairs = [
+    { label: 'titular', target: 'destino' },
+    { label: 'titular destino', target: 'destino' },
+    { label: 'beneficiario', target: 'destino' },
+    { label: 'cuenta a acreditar', target: 'destino' },
+    { label: 'destinatario', target: 'destino' },
+    { label: 'cuenta origen', target: 'origen' },
+    { label: 'cuenta de debito', target: 'origen' },
+    { label: 'cuenta de débito', target: 'origen' },
+    { label: 'titular origen', target: 'origen' },
+    { label: 'ordenante', target: 'origen' }
+  ];
+
+  function looksLikeLabel_(line, label) {
+    const n = normalizeAccountName_(line);
+    const lbl = normalizeAccountName_(label);
+    return n.indexOf(lbl) !== -1;
+  }
+
+  for (var i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    for (var j = 0; j < labelPairs.length; j++) {
+      if (!looksLikeLabel_(line, labelPairs[j].label)) continue;
+      // valor en la misma línea después de ":"
+      let value = null;
+      const m = /:\s*(.+)$/.exec(line);
+      if (m && m[1]) value = m[1].trim();
+      // o en la línea siguiente si no hay valor en la misma
+      if (!value && (i + 1 < lines.length)) {
+        const next = lines[i + 1];
+        const nextNorm = normalizeAccountName_(next);
+        if (next && nextNorm && nextNorm.indexOf(labelPairs[j].label) === -1) {
+          value = next.trim();
+        }
+      }
+      if (!value) continue;
+      if (labelPairs[j].target === 'origen' && !origen) origen = value;
+      if (labelPairs[j].target === 'destino' && !destino) destino = value;
+    }
+  }
+
+  return { origen: origen, destino: destino };
+}
+
 function getOcrSection_(bodyForAI) {
   const t = (bodyForAI || '').toString();
   const ocrIdx = t.indexOf('=== OCR');
@@ -1988,6 +2063,25 @@ function procesarEmailsDeCuenta(emailOrigen) {
               threadFinalized = true;
               break;
             }
+            // Regla: si el titular DESTINO no parece consorcio/Artuso, descartar (falso positivo de pago saliente).
+            // Si no se detecta destino, pasar a REQUIERE REVISION (no descartar directamente).
+            const titulares = extractTitularesFromOcr_(ocrText || '');
+            const titularDestino = titulares.destino || '';
+            if (titularDestino && !isConsorcioLike_(titularDestino) && !isArtusoLike_(titularDestino)) {
+              log(`(Central) DESCARTADO: destino no-consorcio/no-Artuso (${titularDestino}) | ${subject}`);
+              thread.addLabel(etiquetaDescartado);
+              thread.removeLabel(etiquetaEnProceso);
+              clearThreadLease_(threadId);
+              threadFinalized = true;
+              break;
+            } else if (!titularDestino) {
+              log(`(Central) REQUIERE REVISION: destino no detectado en OCR | ${subject}`);
+              thread.addLabel(etiquetaRequiereRevision);
+              thread.removeLabel(etiquetaEnProceso);
+              clearThreadLease_(threadId);
+              threadFinalized = true;
+              break;
+            }
             // Nota: si el LLM está en "review", dejamos pasar y lo marcamos en observaciones.
             
             // PASO 2: Extraer datos con IA y guardar en Sheet
@@ -2078,10 +2172,10 @@ function procesarEmailsDeCuenta(emailOrigen) {
               }
 
               if (ocrOnly) {
-              const edFromOcr = extractEdFromOcr_(ocrOnly);
-              if (edFromOcr && normalizeForMatch_(edFromOcr) !== normalizeForMatch_(currentEd2)) {
-                qaTags.push(`SUG_ED_OCR=${truncateText_(edFromOcr, 45)}`);
-              }
+                const edFromOcr = extractEdFromOcr_(ocrOnly);
+                if (edFromOcr && normalizeForMatch_(edFromOcr) !== normalizeForMatch_(currentEd2)) {
+                  qaTags.push(`SUG_ED_OCR=${truncateText_(edFromOcr, 45)}`);
+                }
               const dptoFromOcr = extractDeptoFromOcr_(ocrOnly) || extractDptoFromUnidadLike_(ocrOnly) || extractDeptoFromObservacionesOcr_(ocrOnly);
                 const dptoFromOcrNorm = normalizeDpto_(dptoFromOcr);
                 if (dptoFromOcrNorm && normalizeForMatch_(dptoFromOcrNorm) !== normalizeForMatch_(currentDptoNorm || '')) {
@@ -2333,10 +2427,6 @@ function procesarEmailsDeCuenta(emailOrigen) {
               if (obsAdmin) {
                 commentParts.push('ADMIN: revisar mensaje del pagador');
                 qaTags.push('QA_MSG_ADMIN_LLM');
-              }
-              // Marcar observación manual si hay múltiples comprobantes detectados
-              if (multipleReceipts) {
-                commentParts.push(`ADMIN: email con múltiples comprobantes (n=${receiptMarkers})`);
               }
 
               const labelSuffix = commentParts.length > 0 ? ` (${commentParts.join(' | ')})` : '';

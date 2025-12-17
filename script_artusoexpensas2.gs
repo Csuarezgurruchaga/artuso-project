@@ -12,6 +12,7 @@ const CONFIG = {
   ETIQUETA_DESCARTADO: 'ExpensaDescartada',
   ETIQUETA_EN_PROCESO: 'ExpensaEnProceso',
   ETIQUETA_REQUIERE_REVISION: 'REQUIERE REVISION',
+  ETIQUETA_MULTIPLES_COMPROBANTES: 'MULTIPLES COMPROBANTES',
   DIAS_BUSQUEDA: 1,
   MAX_THREADS_PER_RUN: 10,
   MAX_MESSAGES_PER_THREAD: 20,
@@ -2010,6 +2011,10 @@ function procesarEmailsDeCuenta(emailOrigen) {
               const receiptMarkers = countReceiptMarkers_(ocrText);
               const multipleReceipts = receiptMarkers >= 2;
               if (multipleReceipts) qaTags.push('QA_MULTIPLE_RECEIPTS');
+              if (multipleReceipts) {
+                const etiquetaMultiples = crearObtenerEtiqueta(CONFIG.ETIQUETA_MULTIPLES_COMPROBANTES);
+                thread.addLabel(etiquetaMultiples);
+              }
 
               // Deduplicación de montos por fuente solo cuando parece un único comprobante.
               if (!multipleReceipts) {
@@ -2269,10 +2274,12 @@ function procesarEmailsDeCuenta(emailOrigen) {
               // Si faltan datos críticos, no completar la fila: etiquetar para revisión humana y continuar
               const missingMonto = (amountToSave == null || amountToSave === '');
               const missingEd = (!buildingFinal || buildingFinal.toString().trim() === '');
-              if (missingMonto || missingEd) {
+              // Política cauta: si hay múltiples comprobantes, forzar revisión.
+              if (missingMonto || missingEd || multipleReceipts) {
                 const reasons = [];
                 if (missingMonto) reasons.push('MONTO');
                 if (missingEd) reasons.push('ED');
+                if (multipleReceipts) reasons.push('MULTIPLES_COMPROBANTES');
                 log(`(Central) REQUIERE REVISION: faltante ${reasons.join(', ')} | ${subject}`);
                 thread.addLabel(etiquetaRequiereRevision);
                 thread.removeLabel(etiquetaEnProceso);
@@ -2326,6 +2333,10 @@ function procesarEmailsDeCuenta(emailOrigen) {
               if (obsAdmin) {
                 commentParts.push('ADMIN: revisar mensaje del pagador');
                 qaTags.push('QA_MSG_ADMIN_LLM');
+              }
+              // Marcar observación manual si hay múltiples comprobantes detectados
+              if (multipleReceipts) {
+                commentParts.push(`ADMIN: email con múltiples comprobantes (n=${receiptMarkers})`);
               }
 
               const labelSuffix = commentParts.length > 0 ? ` (${commentParts.join(' | ')})` : '';

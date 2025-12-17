@@ -1449,6 +1449,7 @@ Campos a extraer:
 - estado: string en MAYUSCULAS (ej: "PENDIENTE", "APROBADO") si el email contiene un campo tipo "Estado: ...". Si no aparece, usa null. Si aparece "Estado: Pendiente", devuelve "PENDIENTE".
 - ed: direccion del edificio/consorcio (solo calle y numero, sin piso ni depto). Debe preservar numeración compuesta tipo "2647/51". Ejemplos: "Paraguay 2949", "Av Santa Fe 2647/51", "Araoz 380". Si no hay dirección, usa null.
 - pagador: nombre y apellido o razón social que figure como titular/emisor/ordenante del comprobante (si aparece). Si no hay, usa null.
+- observacion_admin: string breve o null. Solo completa si el email contiene un pedido/reclamo/comentario para la administración (ej: no puedo adjuntar comprobante, por favor verificar, no puedo pagar hasta..., reclamo). No repitas montos, DPTO, UF, CBU ni datos sensibles. Si no hay mensaje, usa null.
 
 Input:
 ${truncatedBody}
@@ -2320,6 +2321,13 @@ function procesarEmailsDeCuenta(emailOrigen) {
               if (qaTags && qaTags.length) {
                 commentParts.push(`QA: ${qaTags.join(', ')}`);
               }
+              // Marcar observación de mensaje a administración si el LLM lo detectó
+              const obsAdmin = (extractedData.observacion_admin || '').toString().trim();
+              if (obsAdmin) {
+                commentParts.push('ADMIN: revisar mensaje del pagador');
+                qaTags.push('QA_MSG_ADMIN_LLM');
+              }
+
               const labelSuffix = commentParts.length > 0 ? ` (${commentParts.join(' | ')})` : '';
               const rawLabel = `Abrir email${labelSuffix}`;
 

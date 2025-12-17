@@ -657,6 +657,12 @@ function detectReceiptLikeOcr_(ocrText) {
   return hasAmount && (hasTransferWord || hasBankFields) && (hasDate || /(referencia|motivo|concepto)/.test(t));
 }
 
+function countReceiptMarkers_(ocrText) {
+  if (!ocrText) return 0;
+  const markers = ocrText.match(/\[(?:adjunto|inline): /g);
+  return markers ? markers.length : 0;
+}
+
 function extractPayerCuitFromOcr_(ocrText) {
   const t = (ocrText || '').toString();
   if (!t) return null;
@@ -934,6 +940,24 @@ function parseAmount_(value) {
   }
   const n = Number(s);
   return isNaN(n) ? null : n;
+}
+
+function extractMontosFromTextLoose_(text) {
+  const t = (text || '').toString();
+  if (!t) return [];
+  const moneyRe = /(?:\$?\s*)(\d{1,3}(?:[.\s]\d{3})+(?:,\d{2})|\d{4,}(?:[.,]\d{2})?)/g;
+  const out = [];
+  const seen = {};
+  let m;
+  while ((m = moneyRe.exec(t)) !== null) {
+    const parsed = parseAmount_(m[1]);
+    if (parsed == null) continue;
+    const key = String(parsed);
+    if (seen[key]) continue;
+    seen[key] = true;
+    out.push(parsed);
+  }
+  return out;
 }
 
 function ocrBlobViaDrive_(blob, filename, ocrLanguage) {
@@ -1968,6 +1992,47 @@ function procesarEmailsDeCuenta(emailOrigen) {
               const qaTags = [];
               const currentEd2 = (extractedData.ed || '').toString();
               const currentDpto2 = (extractedData.dpto || '').toString().trim();
+
+              // Determinar si hay múltiples recibos (marcadores de OCR de adjuntos/inline)
+              const receiptMarkers = countReceiptMarkers_(ocrText);
+              const multipleReceipts = receiptMarkers >= 2;
+              if (multipleReceipts) qaTags.push('QA_MULTIPLE_RECEIPTS');
+
+              // Deduplicación de montos por fuente solo cuando parece un único comprobante.
+              if (!multipleReceipts) {
+                const montosFromOcr = ocrText ? (extractMontosFromOcr_(ocrText).montos || []) : [];
+                const montosFromBody = extractMontosFromTextLoose_(body);
+                const montosFromSubject = extractMontosFromTextLoose_(subject);
+                const montosFromLlm = (extractedData.montos || []).map(parseAmount_).filter(function(v) { return v != null; });
+
+                const merged = [];
+                const seenMonto = {};
+                let dedupAcrossSources = false;
+
+                function addMonto_(value, source) {
+                  const n = parseAmount_(value);
+                  if (n == null) return;
+                  const key = String(n);
+                  if (seenMonto[key]) {
+                    dedupAcrossSources = true;
+                    return;
+                  }
+                  seenMonto[key] = source || 'unknown';
+                  merged.push(n);
+                }
+
+                montosFromOcr.forEach(function(v) { addMonto_(v, 'ocr'); });
+                montosFromBody.forEach(function(v) { addMonto_(v, 'body'); });
+                montosFromSubject.forEach(function(v) { addMonto_(v, 'subject'); });
+                montosFromLlm.forEach(function(v) { addMonto_(v, 'llm'); });
+
+                if (merged.length > 0) {
+                  extractedData.montos = merged;
+                  extractedData.monto = merged[0];
+                  if (merged.length === 1) extractedData.monto_total = merged[0];
+                }
+                if (dedupAcrossSources) qaTags.push('QA_DEDUP_MONTO_BODY');
+              }
 
               // Auditoría (no corrige): sugerencias desde email + OCR
               const emailEd = extractEdFromEmailText_(fullTextForRules);

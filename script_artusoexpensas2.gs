@@ -2127,20 +2127,9 @@ function procesarEmailsDeCuenta(emailOrigen) {
               }
 
               // Múltiples comprobantes: sumar montos si hay array
-              let amountToSave = parseAmount_(extractedData.monto);
-              const montos = extractedData.montos;
-              const parsedMontoTotal = parseAmount_(extractedData.monto_total);
-              if (parsedMontoTotal != null) {
-                amountToSave = parsedMontoTotal;
-              } else if (montos && montos.length && montos.length > 1) {
-                const sum = montos.reduce(function(acc, v) {
-                  const n = parseAmount_(v);
-                  return acc + (n == null ? 0 : n);
-                }, 0);
-                if (sum > 0) amountToSave = sum;
-              }
-              // Fallback determinístico: si el LLM no devolvió monto, usar OCR (líneas con "importe/monto/total").
-              if (amountToSave == null && ocrText) {
+              let amountToSave = null;
+              // Prioridad: OCR > LLM. Si hay montos OCR, usarlos primero.
+              if (ocrText) {
                 try {
                   const ocrAmounts = extractMontosFromOcr_(ocrText);
                   if (ocrAmounts && ocrAmounts.monto_total != null) {
@@ -2154,8 +2143,24 @@ function procesarEmailsDeCuenta(emailOrigen) {
                     }
                   }
                 } catch (eAmt) {
-                  log(`(Central) Error monto OCR fallback: ${eAmt.toString()}`);
+                  log(`(Central) Error monto OCR: ${eAmt.toString()}`);
                 }
+              }
+
+              // Si no hay OCR o no trajo valor, recurrir al LLM
+              if (amountToSave == null) {
+                amountToSave = parseAmount_(extractedData.monto);
+              }
+              const montos = extractedData.montos;
+              const parsedMontoTotal = parseAmount_(extractedData.monto_total);
+              if (parsedMontoTotal != null) {
+                amountToSave = parsedMontoTotal;
+              } else if (montos && montos.length && montos.length > 1) {
+                const sum = montos.reduce(function(acc, v) {
+                  const n = parseAmount_(v);
+                  return acc + (n == null ? 0 : n);
+                }, 0);
+                if (sum > 0) amountToSave = sum;
               }
 
               // ED: si no hay dirección válida, fallback determinístico a "Pagador - CUIT/CUIL:.."
@@ -2277,13 +2282,11 @@ function procesarEmailsDeCuenta(emailOrigen) {
               if (edFallbackApplied && (edFallbackKind === 'PAGADOR' || edFallbackKind === 'PAGADOR_CUIT' || edFallbackKind === 'FIRMA' || edFallbackKind === 'MOTIVO' || edFallbackKind === 'REENVIO')) {
                 qaTags.push('QA_ED_SIN_DIRECCION');
               }
-              // Fallback para cocheras: si no hay dpto/uf y el texto menciona cocheras con número.
-              if (!extractedData.dpto && !extractedData.uf) {
-                const cocheraDpto = extractCocheraDptoFromText_(fullTextForRules);
-                if (cocheraDpto) {
-                  extractedData.dpto = cocheraDpto;
-                  qaTags.push('FIX_DPTO_COCHERA');
-                }
+              // Fallback para cocheras: si el texto menciona cocheras con número, sobrescribir DPTO con cocheras.
+              const cocheraDpto = extractCocheraDptoFromText_(fullTextForRules);
+              if (cocheraDpto) {
+                extractedData.dpto = cocheraDpto;
+                qaTags.push('FIX_DPTO_COCHERA_OVERRIDE');
               }
 
               const commentParts = [];

@@ -897,6 +897,18 @@ function extractDeptoFromOcr_(ocrText) {
   return `${num}-${letter}`;
 }
 
+function extractDeptoFromObservacionesOcr_(ocrText) {
+  const t = normalizeForMatch_(ocrText);
+  if (!t) return null;
+  // Patrones tipo "expensas dic 8 e", "expensas 8e", "expensas 8 e <texto>"
+  const re = /\bexpensas?[^\n]{0,40}\b0*([0-9]{1,2})\s*([a-z])\b/i;
+  const m = re.exec(ocrText);
+  if (!m || !m[1] || !m[2]) return null;
+  const num = String(parseInt(m[1], 10));
+  const letter = String(m[2]).toUpperCase();
+  return `Piso ${num} Dpto ${letter}`;
+}
+
 function extractDptoFromUnidadLike_(ocrText) {
   const t = (ocrText || '').toString();
   if (!t) return null;
@@ -2060,11 +2072,11 @@ function procesarEmailsDeCuenta(emailOrigen) {
               }
 
               if (ocrOnly) {
-                const edFromOcr = extractEdFromOcr_(ocrOnly);
-                if (edFromOcr && normalizeForMatch_(edFromOcr) !== normalizeForMatch_(currentEd2)) {
-                  qaTags.push(`SUG_ED_OCR=${truncateText_(edFromOcr, 45)}`);
-                }
-                const dptoFromOcr = extractDeptoFromOcr_(ocrOnly) || extractDptoFromUnidadLike_(ocrOnly);
+              const edFromOcr = extractEdFromOcr_(ocrOnly);
+              if (edFromOcr && normalizeForMatch_(edFromOcr) !== normalizeForMatch_(currentEd2)) {
+                qaTags.push(`SUG_ED_OCR=${truncateText_(edFromOcr, 45)}`);
+              }
+              const dptoFromOcr = extractDeptoFromOcr_(ocrOnly) || extractDptoFromUnidadLike_(ocrOnly) || extractDeptoFromObservacionesOcr_(ocrOnly);
                 const dptoFromOcrNorm = normalizeDpto_(dptoFromOcr);
                 if (dptoFromOcrNorm && normalizeForMatch_(dptoFromOcrNorm) !== normalizeForMatch_(currentDptoNorm || '')) {
                   qaTags.push(`SUG_DPTO_OCR=${truncateText_(dptoFromOcrNorm, 20)}`);
@@ -2155,6 +2167,28 @@ function procesarEmailsDeCuenta(emailOrigen) {
               const emailEdCandidate = extractEdFromEmailText_(fullTextForRules);
               const ocrEdCandidate = ocrOnly ? extractEdFromOcr_(ocrOnly) : null;
               const hasAnyValidAddressCandidate = (emailEdCandidate && isValidEd_(emailEdCandidate)) || (ocrEdCandidate && isValidEd_(ocrEdCandidate));
+              // Fallback: si tenemos DPTO pero no ED, usar Beneficiario/Observaciones como identificador de edificio.
+              if (!hasValidEd && !hasAnyValidAddressCandidate && currentDptoNorm) {
+                // Prioridad a Beneficiario en OCR
+                const ocrNorm = normalizeForMatch_(ocrOnly || '');
+                let ocrBenef = null;
+                const benefRe = /\bbeneficiario\b\s*:\s*([A-ZÁÉÍÓÚÑ0-9 .,'/-]{3,80})/i;
+                const mb = benefRe.exec(ocrOnly || '');
+                if (mb && mb[1]) ocrBenef = mb[1].trim();
+
+                const obsRe = /\bobservac(?:iones)?\b\s*:\s*([A-ZÁÉÍÓÚÑ0-9 .,'/-]{3,120})/i;
+                const mo = obsRe.exec(ocrOnly || '');
+                let ocrObs = null;
+                if (mo && mo[1]) ocrObs = mo[1].trim();
+
+                const fallbackEd = ocrBenef || ocrObs;
+                if (fallbackEd) {
+                  buildingFinal = fallbackEd;
+                  edFallbackApplied = true;
+                  edFallbackKind = 'OBS';
+                  qaTags.push('FIX_ED_OBS');
+                }
+              }
 
               if (!hasValidEd && !hasAnyValidAddressCandidate) {
                 const payerCuit = extractPayerCuitFromOcr_(ocrText);

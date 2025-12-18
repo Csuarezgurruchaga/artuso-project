@@ -86,6 +86,9 @@ const OCR_CONFIG = {
 
 var OCR_CALLS_RUN = 0;
 
+const DISCARD_STATE_MONTH_KEY = 'DESCARTADO_STATE_MONTH';
+const DISCARD_LASTMSG_PREFIX = 'DESCARTADO_LASTMSG_';
+
 /**
  * Determina el separador de argumentos de fórmula según el locale.
  */
@@ -93,6 +96,19 @@ function getFormulaSeparator(locale) {
   if (!locale) return ',';
   const normalized = locale.toLowerCase().split('_')[0];
   return LOCALES_SEMICOLON.includes(normalized) ? ';' : ',';
+}
+
+function getMonthStartQuery_() {
+  const tz = 'America/Argentina/Buenos_Aires';
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), 1);
+  const formatted = Utilities.formatDate(start, tz, 'yyyy/MM/dd');
+  return `after:${formatted}`;
+}
+
+function getMonthKey_() {
+  const tz = 'America/Argentina/Buenos_Aires';
+  return Utilities.formatDate(new Date(), tz, 'yyyy-MM');
 }
 
 function canUseDriveOcr_() {
@@ -138,6 +154,45 @@ function escapeLabelForQuery_(labelName) {
   return `"${s.replace(/"/g, '\\"')}"`;
 }
 
+function cleanupDiscardStateIfNeeded_() {
+  const props = PropertiesService.getScriptProperties();
+  const current = getMonthKey_();
+  const last = props.getProperty(DISCARD_STATE_MONTH_KEY);
+  if (last === current) return;
+
+  const all = props.getProperties();
+  const prefix = DISCARD_LASTMSG_PREFIX;
+  Object.keys(all).forEach(key => {
+    if (key.indexOf(prefix) === 0) {
+      props.deleteProperty(key);
+    }
+  });
+  props.setProperty(DISCARD_STATE_MONTH_KEY, current);
+}
+
+function getDiscardLastMsgKey_(threadId) {
+  return DISCARD_LASTMSG_PREFIX + threadId;
+}
+
+function getDiscardLastMsgMs_(threadId) {
+  const raw = PropertiesService.getScriptProperties().getProperty(getDiscardLastMsgKey_(threadId));
+  if (!raw) return null;
+  const parsed = parseInt(raw, 10);
+  return isNaN(parsed) ? null : parsed;
+}
+
+function setDiscardLastMsgMs_(threadId, dateObj) {
+  if (!dateObj) return;
+  PropertiesService.getScriptProperties().setProperty(
+    getDiscardLastMsgKey_(threadId),
+    String(dateObj.getTime())
+  );
+}
+
+function clearDiscardLastMsgMs_(threadId) {
+  PropertiesService.getScriptProperties().deleteProperty(getDiscardLastMsgKey_(threadId));
+}
+
 function setThreadLease_(threadId, when) {
   const iso = (when || new Date()).toISOString();
   PropertiesService.getScriptProperties().setProperty(getThreadLeaseKey_(threadId), iso);
@@ -177,6 +232,53 @@ function isOcrSupported_(filename, contentType) {
   if (contentType && contentType.indexOf('image/') === 0) return true;
   if (contentType === 'application/pdf') return true;
   return /\.(pdf|png|jpe?g)$/i.test(lower);
+}
+
+function hasRelevantAttachment_(message) {
+  const attachments = message.getAttachments({ includeInlineImages: true });
+  if (!attachments || attachments.length === 0) return false;
+
+  const minBytes = OCR_CONFIG.MIN_INLINE_IMAGE_BYTES || 0;
+  for (let i = 0; i < attachments.length; i++) {
+    const att = attachments[i];
+    const blob = att.copyBlob();
+    const name = att.getName ? (att.getName() || '') : '';
+    const contentType = blob.getContentType ? (blob.getContentType() || '') : '';
+    const lower = name.toLowerCase();
+    const isPdf = contentType === 'application/pdf' || lower.endsWith('.pdf');
+    const isImage = contentType.indexOf('image/') === 0 || /\.(jpg|jpeg|png|gif)$/i.test(lower);
+    if (!isPdf && !isImage) continue;
+    if (isImage) {
+      const size = blob.getBytes().length;
+      if (size < minBytes) continue;
+    }
+    return true;
+  }
+
+  return false;
+}
+
+function reabrirDescartadosConAdjunto_(etiquetaDescartado, labelDescartadoName, limit) {
+  const query = `in:inbox label:${escapeLabelForQuery_(labelDescartadoName)} ${getMonthStartQuery_()}`;
+  const threads = GmailApp.search(query, 0, limit || CONFIG.MAX_THREADS_PER_RUN);
+  if (!threads.length) return;
+
+  threads.forEach(thread => {
+    const threadId = thread.getId();
+    const lastDate = thread.getLastMessageDate();
+    const lastMs = getDiscardLastMsgMs_(threadId);
+    if (lastMs && lastDate && lastDate.getTime() <= lastMs) {
+      return;
+    }
+
+    const messages = thread.getMessages();
+    const lastMessage = messages[messages.length - 1];
+    if (lastMessage && hasRelevantAttachment_(lastMessage)) {
+      thread.removeLabel(etiquetaDescartado);
+    }
+
+    setDiscardLastMsgMs_(threadId, lastDate);
+  });
 }
 
 function truncateText_(text, maxChars) {
@@ -1337,8 +1439,18 @@ const AI_ADAPTERS = {
 
 const PALABRAS_CLAVE_EXPENSA = {
   expensa: [
-    'expensa', 'expensas', 'expesnas', // incluye typo común
-    'gasto común', 'gastos comunes',
+    'expensa', 'expensas',
+    // Typos comunes
+    'expesnas',   // intercambio n/s
+    'espensas',   // x→s (muy común en español)
+    'expnsas',    // falta e
+    'expesas',    // falta n
+    'expenss',    // falta a
+    'expenas',    // falta s
+    'exppensas',  // p duplicada
+    'expensass',  // s duplicada
+    'expenzas',   // s→z
+    // Formato especial
     'expensas uf' // formato "Expensas UF 64"
   ],
   pago: [
@@ -2021,12 +2133,16 @@ function procesarEmailsDeCuenta(emailOrigen) {
     const labelDescartadoName = (CONFIG.ETIQUETA_DESCARTADO || 'ExpensaDescartada').toString().trim();
     const labelEnProcesoName = (CONFIG.ETIQUETA_EN_PROCESO || 'ExpensaEnProceso').toString().trim();
     const labelRequiereRevisionName = (CONFIG.ETIQUETA_REQUIERE_REVISION || 'REQUIERE REVISION').toString().trim();
-    const days = Number(CONFIG.DIAS_BUSQUEDA || 1);
+    const monthQuery = getMonthStartQuery_();
 
-    const queryEnProceso = `in:anywhere label:${escapeLabelForQuery_(labelEnProcesoName)} -label:${escapeLabelForQuery_(labelProcesadoName)} -label:${escapeLabelForQuery_(labelDescartadoName)} -label:${escapeLabelForQuery_(labelRequiereRevisionName)}`;
+    cleanupDiscardStateIfNeeded_();
+    const etiquetaDescartado = crearObtenerEtiqueta(labelDescartadoName);
+    reabrirDescartadosConAdjunto_(etiquetaDescartado, labelDescartadoName, CONFIG.MAX_THREADS_PER_RUN);
+
+    const queryEnProceso = `in:anywhere ${monthQuery} label:${escapeLabelForQuery_(labelEnProcesoName)} -label:${escapeLabelForQuery_(labelProcesadoName)} -label:${escapeLabelForQuery_(labelDescartadoName)} -label:${escapeLabelForQuery_(labelRequiereRevisionName)}`;
     const threadsEnProceso = GmailApp.search(queryEnProceso, 0, CONFIG.MAX_THREADS_PER_RUN);
 
-    const queryNuevos = `in:inbox -label:${escapeLabelForQuery_(labelProcesadoName)} -label:${escapeLabelForQuery_(labelDescartadoName)} -label:${escapeLabelForQuery_(labelEnProcesoName)} -label:${escapeLabelForQuery_(labelRequiereRevisionName)} newer_than:${days}d`;
+    const queryNuevos = `in:inbox ${monthQuery} -label:${escapeLabelForQuery_(labelProcesadoName)} -label:${escapeLabelForQuery_(labelDescartadoName)} -label:${escapeLabelForQuery_(labelEnProcesoName)} -label:${escapeLabelForQuery_(labelRequiereRevisionName)}`;
     const threadsNuevos = GmailApp.search(queryNuevos, 0, CONFIG.MAX_THREADS_PER_RUN);
     const threadsNuevosPlusOne = GmailApp.search(queryNuevos, 0, CONFIG.MAX_THREADS_PER_RUN + 1);
     const hayMasNuevos = threadsNuevosPlusOne.length > threadsNuevos.length;
@@ -2056,7 +2172,6 @@ function procesarEmailsDeCuenta(emailOrigen) {
     }
 
     const etiqueta = crearObtenerEtiqueta(labelProcesadoName);
-    const etiquetaDescartado = crearObtenerEtiqueta(labelDescartadoName);
     const etiquetaEnProceso = crearObtenerEtiqueta(labelEnProcesoName);
     const etiquetaRequiereRevision = crearObtenerEtiqueta(labelRequiereRevisionName);
 
@@ -2082,6 +2197,7 @@ function procesarEmailsDeCuenta(emailOrigen) {
 
         const messages = messagesByThread[ti] || [];
         const maxMessages = Math.min(messages.length, CONFIG.MAX_MESSAGES_PER_THREAD);
+        const processedAllMessages = messages.length <= maxMessages;
         let threadFinalized = false;
 
         for (var mi = 0; mi < maxMessages; mi++) {
@@ -2099,6 +2215,7 @@ function procesarEmailsDeCuenta(emailOrigen) {
           if (REGEX_RESUMEN_PROCESAMIENTO.test(subjectPre.trim())) {
             log(`(Central) SKIP resumen: ${subjectPre}`);
             thread.addLabel(etiquetaDescartado);
+            setDiscardLastMsgMs_(threadId, thread.getLastMessageDate());
             thread.removeLabel(etiquetaEnProceso);
             clearThreadLease_(threadId);
             threadFinalized = true;
@@ -2122,6 +2239,7 @@ function procesarEmailsDeCuenta(emailOrigen) {
             if (shouldDiscardOutgoingCarlosArtuso_(subject, body)) {
               log(`(Central) DESCARTADO: transferencia saliente de Carlos Artuso | ${subject}`);
               thread.addLabel(etiquetaDescartado);
+              setDiscardLastMsgMs_(threadId, thread.getLastMessageDate());
               thread.removeLabel(etiquetaEnProceso);
               clearThreadLease_(threadId);
               threadFinalized = true;
@@ -2162,6 +2280,7 @@ function procesarEmailsDeCuenta(emailOrigen) {
               const etiquetaMultiples = crearObtenerEtiqueta(CONFIG.ETIQUETA_MULTIPLES_COMPROBANTES);
               thread.addLabel(etiquetaMultiples);
               thread.addLabel(etiquetaRequiereRevision);
+              clearDiscardLastMsgMs_(threadId);
               thread.removeLabel(etiquetaEnProceso);
               clearThreadLease_(threadId);
               threadFinalized = true;
@@ -2179,6 +2298,7 @@ function procesarEmailsDeCuenta(emailOrigen) {
               if (!titularDestinoOcr) {
                 log(`(Central) REQUIERE REVISION: destino no detectado en OCR | ${subject}`);
                 thread.addLabel(etiquetaRequiereRevision);
+                clearDiscardLastMsgMs_(threadId);
                 thread.removeLabel(etiquetaEnProceso);
                 clearThreadLease_(threadId);
                 threadFinalized = true;
@@ -2188,6 +2308,7 @@ function procesarEmailsDeCuenta(emailOrigen) {
               if (!destinoOk) {
                 log(`(Central) DESCARTADO: destino no-consorcio/no-Artuso (${titularDestinoOcr}) | ${subject}`);
                 thread.addLabel(etiquetaDescartado);
+                setDiscardLastMsgMs_(threadId, thread.getLastMessageDate());
                 thread.removeLabel(etiquetaEnProceso);
                 clearThreadLease_(threadId);
                 threadFinalized = true;
@@ -2206,6 +2327,7 @@ function procesarEmailsDeCuenta(emailOrigen) {
               if (tieneExclusionFuerte) {
                 log(`(Central) DESCARTADO por exclusión fuerte: ${subject}`);
                 thread.addLabel(etiquetaDescartado);
+                setDiscardLastMsgMs_(threadId, thread.getLastMessageDate());
                 thread.removeLabel(etiquetaEnProceso);
                 clearThreadLease_(threadId);
                 threadFinalized = true;
@@ -2217,6 +2339,7 @@ function procesarEmailsDeCuenta(emailOrigen) {
               if (nonExpenseConcept) {
                 log(`(Central) DESCARTADO por concepto no-expensa: ${nonExpenseConcept} | ${subject}`);
                 thread.addLabel(etiquetaDescartado);
+                setDiscardLastMsgMs_(threadId, thread.getLastMessageDate());
                 thread.removeLabel(etiquetaEnProceso);
                 clearThreadLease_(threadId);
                 threadFinalized = true;
@@ -2234,6 +2357,7 @@ function procesarEmailsDeCuenta(emailOrigen) {
                 log(`(Central) ✗ LLM rejected: ${subject} | Reason: ${validation.reviewReason || 'LLM_REJECT'}`);
                 // No etiquetar como expensa - evitar re-procesamiento
                 thread.addLabel(etiquetaDescartado);
+                setDiscardLastMsgMs_(threadId, thread.getLastMessageDate());
                 thread.removeLabel(etiquetaEnProceso);
                 clearThreadLease_(threadId);
                 threadFinalized = true;
@@ -2599,6 +2723,7 @@ function procesarEmailsDeCuenta(emailOrigen) {
                 if (multipleReceipts) reasons.push('MULTIPLES_COMPROBANTES');
                 log(`(Central) REQUIERE REVISION: faltante ${reasons.join(', ')} | ${subject}`);
                 thread.addLabel(etiquetaRequiereRevision);
+                clearDiscardLastMsgMs_(threadId);
                 thread.removeLabel(etiquetaEnProceso);
                 clearThreadLease_(threadId);
                 threadFinalized = true;
@@ -2665,10 +2790,16 @@ function procesarEmailsDeCuenta(emailOrigen) {
               log(`(Central) Datos extraídos: ${JSON.stringify(extractedData)}`);
             } catch (extractError) {
               log(`(Central) Error extrayendo datos con IA: ${extractError.toString()}`);
-              // Continúa aunque falle la extracción - el email ya fue validado como expensa
+              thread.addLabel(etiquetaRequiereRevision);
+              clearDiscardLastMsgMs_(threadId);
+              thread.removeLabel(etiquetaEnProceso);
+              clearThreadLease_(threadId);
+              threadFinalized = true;
+              break;
             }
             
             thread.addLabel(etiqueta);
+            clearDiscardLastMsgMs_(threadId);
             thread.removeLabel(etiquetaEnProceso);
             clearThreadLease_(threadId);
             stats.reenviados++; // usamos este campo como "marcados"
@@ -2683,6 +2814,10 @@ function procesarEmailsDeCuenta(emailOrigen) {
         if (!threadFinalized) {
           thread.removeLabel(etiquetaEnProceso);
           clearThreadLease_(threadId);
+          if (processedAllMessages) {
+            thread.addLabel(etiquetaDescartado);
+            setDiscardLastMsgMs_(threadId, thread.getLastMessageDate());
+          }
         }
       } catch (e) {
         const msg = (e && (e.message || e.toString())) ? (e.message || e.toString()) : '';
@@ -3130,6 +3265,7 @@ function testLLMValidation() {
     
     let passedKeywords = 0;
     let passedLLM = 0;
+    let reviewLLM = 0;
     let rejectedLLM = 0;
     
     threads.forEach((thread, index) => {
@@ -3148,11 +3284,18 @@ function testLLMValidation() {
         
         // Paso 2: Verificar con LLM
         try {
-          const isValidByLLM = validateExpensePaymentWithLLM(subject, body);
-          log(`  LLM: ${isValidByLLM ? 'CONFIRMADO' : 'RECHAZADO'}`);
+          const validation = validateExpensePaymentWithLLM(subject, body);
+          const llmStatus = validation.isValid
+            ? (validation.review ? 'REVIEW' : 'CONFIRMADO')
+            : 'RECHAZADO';
+          log(`  LLM: ${llmStatus}`);
           
-          if (isValidByLLM) {
-            passedLLM++;
+          if (validation.isValid) {
+            if (validation.review) {
+              reviewLLM++;
+            } else {
+              passedLLM++;
+            }
           } else {
             rejectedLLM++;
           }
@@ -3168,6 +3311,7 @@ function testLLMValidation() {
     log(`Total emails analizados: ${threads.length}`);
     log(`Pasaron filtro keywords: ${passedKeywords}`);
     log(`Confirmados por LLM: ${passedLLM}`);
+    log(`En revisión por LLM: ${reviewLLM}`);
     log(`Rechazados por LLM: ${rejectedLLM}`);
     log(`Tasa de rechazo LLM: ${passedKeywords > 0 ? Math.round(rejectedLLM / passedKeywords * 100) : 0}%`);
     log('=== FIN DE PRUEBA ===');

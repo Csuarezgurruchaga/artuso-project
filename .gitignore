@@ -4,3 +4,4 @@ false_positives
 examples
 *.png
 readme.txt
+.DS_Store

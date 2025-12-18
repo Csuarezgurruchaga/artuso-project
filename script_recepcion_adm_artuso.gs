@@ -11,8 +11,11 @@ const CONFIG = {
   EMAILS_ORIGEN: ['recepcion.adm.artuso@gmail.com'],
   EMAIL_DESTINO: 'artusoexpensas2@gmail.com',
   ETIQUETA_PROCESADO: 'ExpensaProcesada',
+  ETIQUETA_DESCARTADO: 'ExpensaDescartada',
   DEBUG: true
 };
+
+const MIN_INLINE_IMAGE_BYTES = 30 * 1024;
 
 // Reutilizamos exactamente la misma lógica que en script_artusocarlos14.gs
 // Copia del contenido a partir de PALABRAS_CLAVE_EXPENSA
@@ -205,7 +208,11 @@ function procesarEmailsExpensas() {
 function procesarEmailsDeCuenta(emailOrigen) {
   const stats = { procesados: 0, reenviados: 0, errores: 0 };
   try {
-    const query = `in:inbox -label:${CONFIG.ETIQUETA_PROCESADO} newer_than:1d`;
+    cleanupDiscardStateIfNeeded_();
+    const etiquetaDescartado = crearObtenerEtiqueta(CONFIG.ETIQUETA_DESCARTADO);
+    reabrirDescartadosConAdjunto_(etiquetaDescartado);
+
+    const query = `in:inbox ${getMonthStartQuery_()} -label:${CONFIG.ETIQUETA_PROCESADO} -label:${CONFIG.ETIQUETA_DESCARTADO}`;
     const threads = GmailApp.search(query, 0, 50);
     log(`Encontrados ${threads.length} threads nuevos en inbox para procesar`);
 
@@ -220,14 +227,18 @@ function procesarEmailsDeCuenta(emailOrigen) {
         const todosLosAdjuntos = messages.flatMap(m => m.getAttachments());
         
         stats.procesados++;
-        
+
+        const threadId = thread.getId();
         if (esComprobanteExpensa(mensaje)) {
           log(`✓ Email identificado como expensa: ${mensaje.getSubject()}`);
           reenviarEmail(mensaje, todosLosAdjuntos);
           stats.reenviados++;
           thread.addLabel(crearObtenerEtiqueta(CONFIG.ETIQUETA_PROCESADO));
+          clearDiscardLastMsgMs_(threadId);
         } else {
           log(`✗ Email NO es expensa: ${mensaje.getSubject()}`);
+          thread.addLabel(etiquetaDescartado);
+          setDiscardLastMsgMs_(threadId, thread.getLastMessageDate());
         }
       } catch (error) {
         log(`Error procesando thread: ${error.toString()}`);
@@ -515,6 +526,112 @@ function reenviarEmail(message, adjuntosExtra) {
   }
 }
 
+function getMonthStartQuery_() {
+  const tz = 'America/Argentina/Buenos_Aires';
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), 1);
+  const formatted = Utilities.formatDate(start, tz, 'yyyy/MM/dd');
+  return `after:${formatted}`;
+}
+
+function getMonthKey_() {
+  const tz = 'America/Argentina/Buenos_Aires';
+  return Utilities.formatDate(new Date(), tz, 'yyyy-MM');
+}
+
+function getDiscardStateMonthKey_() {
+  return 'DESCARTADO_STATE_MONTH';
+}
+
+function getDiscardLastMsgPrefix_() {
+  return 'DESCARTADO_LASTMSG_';
+}
+
+function cleanupDiscardStateIfNeeded_() {
+  const props = PropertiesService.getScriptProperties();
+  const current = getMonthKey_();
+  const last = props.getProperty(getDiscardStateMonthKey_());
+  if (last === current) return;
+
+  const all = props.getProperties();
+  const prefix = getDiscardLastMsgPrefix_();
+  Object.keys(all).forEach(key => {
+    if (key.indexOf(prefix) === 0) {
+      props.deleteProperty(key);
+    }
+  });
+  props.setProperty(getDiscardStateMonthKey_(), current);
+}
+
+function getDiscardLastMsgKey_(threadId) {
+  return getDiscardLastMsgPrefix_() + threadId;
+}
+
+function getDiscardLastMsgMs_(threadId) {
+  const raw = PropertiesService.getScriptProperties().getProperty(getDiscardLastMsgKey_(threadId));
+  if (!raw) return null;
+  const parsed = parseInt(raw, 10);
+  return isNaN(parsed) ? null : parsed;
+}
+
+function setDiscardLastMsgMs_(threadId, dateObj) {
+  if (!dateObj) return;
+  PropertiesService.getScriptProperties().setProperty(
+    getDiscardLastMsgKey_(threadId),
+    String(dateObj.getTime())
+  );
+}
+
+function clearDiscardLastMsgMs_(threadId) {
+  PropertiesService.getScriptProperties().deleteProperty(getDiscardLastMsgKey_(threadId));
+}
+
+function hasRelevantAttachment_(message) {
+  const attachments = message.getAttachments({ includeInlineImages: true });
+  if (!attachments || attachments.length === 0) return false;
+
+  for (let i = 0; i < attachments.length; i++) {
+    const att = attachments[i];
+    const blob = att.copyBlob();
+    const name = att.getName ? (att.getName() || '') : '';
+    const contentType = blob.getContentType ? (blob.getContentType() || '') : '';
+    const lower = name.toLowerCase();
+    const isPdf = contentType === 'application/pdf' || lower.endsWith('.pdf');
+    const isImage = contentType.indexOf('image/') === 0 || /\.(jpg|jpeg|png|gif)$/i.test(lower);
+    if (!isPdf && !isImage) continue;
+    if (isImage) {
+      const size = blob.getBytes().length;
+      if (size < MIN_INLINE_IMAGE_BYTES) continue;
+    }
+    return true;
+  }
+
+  return false;
+}
+
+function reabrirDescartadosConAdjunto_(etiquetaDescartado) {
+  const query = `in:inbox label:${CONFIG.ETIQUETA_DESCARTADO} ${getMonthStartQuery_()}`;
+  const threads = GmailApp.search(query, 0, 50);
+  if (!threads.length) return;
+
+  threads.forEach(thread => {
+    const threadId = thread.getId();
+    const lastDate = thread.getLastMessageDate();
+    const lastMs = getDiscardLastMsgMs_(threadId);
+    if (lastMs && lastDate && lastDate.getTime() <= lastMs) {
+      return;
+    }
+
+    const messages = thread.getMessages();
+    const lastMessage = messages[messages.length - 1];
+    if (lastMessage && hasRelevantAttachment_(lastMessage)) {
+      thread.removeLabel(etiquetaDescartado);
+    }
+
+    setDiscardLastMsgMs_(threadId, lastDate);
+  });
+}
+
 function crearObtenerEtiqueta(nombreEtiqueta) {
   let etiqueta = GmailApp.getUserLabelByName(nombreEtiqueta);
   if (!etiqueta) {
@@ -575,5 +692,3 @@ function ejecutarPrueba() {
     log(`Error en prueba: ${error.toString()}`);
   }
 }
-
-

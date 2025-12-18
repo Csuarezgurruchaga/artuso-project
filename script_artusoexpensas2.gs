@@ -603,15 +603,18 @@ function normalizeAccountName_(name) {
 function isConsorcioLike_(value) {
   const n = normalizeAccountName_(value);
   if (!n) return false;
-  return (
-    n.indexOf('consorcio') !== -1 ||
-    n.indexOf('cons prop') !== -1 ||
-    n.indexOf('cons de prop') !== -1 ||
-    n.indexOf('propietarios') !== -1 ||
-    n.indexOf('consorcios') !== -1 ||
-    n.indexOf('cons.') !== -1 ||
-    n.indexOf('cons prop') !== -1
-  );
+  // Formas completas
+  if (n.indexOf('consorcio') !== -1) return true;
+  if (n.indexOf('propiet') !== -1) return true; // propietarios/propiedad
+
+  // Abreviaciones típicas (OCR):
+  // - "cons prop ..."
+  // - "cons de prop ..."
+  // - "cons d pr ..." (Consorcio de Propietarios)
+  if (/\bcons\b/.test(n) && (/\bprop\b/.test(n) || /\bpropiet/.test(n) || /\bpr\b/.test(n))) return true;
+  if (/\bcons\b\s*(?:d|de)?\s*(?:prop|propiet|pr)\b/.test(n)) return true;
+
+  return false;
 }
 
 function isArtusoLike_(value) {
@@ -626,44 +629,56 @@ function extractTitularesFromOcr_(ocrText) {
   let origen = null;
   let destino = null;
 
-  const labelPairs = [
-    { label: 'titular', target: 'destino' },
-    { label: 'titular destino', target: 'destino' },
-    { label: 'beneficiario', target: 'destino' },
-    { label: 'cuenta a acreditar', target: 'destino' },
-    { label: 'destinatario', target: 'destino' },
-    { label: 'cuenta origen', target: 'origen' },
-    { label: 'cuenta de debito', target: 'origen' },
-    { label: 'cuenta de débito', target: 'origen' },
-    { label: 'titular origen', target: 'origen' },
-    { label: 'ordenante', target: 'origen' }
-  ];
-
-  function looksLikeLabel_(line, label) {
-    const n = normalizeAccountName_(line);
-    const lbl = normalizeAccountName_(label);
-    return n.indexOf(lbl) !== -1;
+  function getValueSameOrNext_(idx) {
+    const line = lines[idx] || '';
+    let value = null;
+    const m = /:\s*(.+)$/.exec(line);
+    if (m && m[1]) value = m[1].trim();
+    if (!value && (idx + 1 < lines.length)) {
+      const next = (lines[idx + 1] || '').trim();
+      // Evitar tomar otra etiqueta como valor
+      const nextNorm = normalizeAccountName_(next);
+      if (next && nextNorm && !/^(fecha|hora|importe|monto|cbu|cvu|alias|banco|cuenta|titular|beneficiario|destinatario|para|concepto|motivo|referencia|operacion|operación|nro|numero|número)\b/.test(nextNorm)) {
+        value = next;
+      }
+    }
+    return value;
   }
+
+  let expectTitularAs = null; // 'origen' | 'destino'
 
   for (var i = 0; i < lines.length; i++) {
     const line = lines[i];
-    for (var j = 0; j < labelPairs.length; j++) {
-      if (!looksLikeLabel_(line, labelPairs[j].label)) continue;
-      // valor en la misma línea después de ":"
-      let value = null;
-      const m = /:\s*(.+)$/.exec(line);
-      if (m && m[1]) value = m[1].trim();
-      // o en la línea siguiente si no hay valor en la misma
-      if (!value && (i + 1 < lines.length)) {
-        const next = lines[i + 1];
-        const nextNorm = normalizeAccountName_(next);
-        if (next && nextNorm && nextNorm.indexOf(labelPairs[j].label) === -1) {
-          value = next.trim();
-        }
-      }
-      if (!value) continue;
-      if (labelPairs[j].target === 'origen' && !origen) origen = value;
-      if (labelPairs[j].target === 'destino' && !destino) destino = value;
+    const ln = normalizeAccountName_(line);
+    if (!ln) continue;
+
+    // Setear contexto para "Titular" (algunos comprobantes tienen 2 "Titular")
+    if (/(cuenta\s*origen|cuenta\s*de\s*debito|cuenta\s*de\s*debito|cuenta\s*a\s*debitar|cuenta\s*d[eé]bito)/.test(ln)) {
+      expectTitularAs = 'origen';
+    } else if (/(cbu\s*cvu\s*destino|cbu\s*destino|cvu\s*destino|cuenta\s*a\s*acreditar|cuenta\s*destino)/.test(ln)) {
+      expectTitularAs = 'destino';
+    }
+
+    // Labels explícitos de destino (preferidos)
+    if (/^destinatario\b/.test(ln) || /^beneficiario\b/.test(ln) || /^para\b/.test(ln) || /^titular\s+destino\b/.test(ln)) {
+      const vDest = getValueSameOrNext_(i);
+      if (vDest && !destino) destino = vDest;
+      continue;
+    }
+
+    // Labels explícitos de origen
+    if (/^ordenante\b/.test(ln) || /^originante\b/.test(ln) || /^titular\s+origen\b/.test(ln)) {
+      const vOrg = getValueSameOrNext_(i);
+      if (vOrg && !origen) origen = vOrg;
+      continue;
+    }
+
+    // Caso "Titular" con contexto
+    if (/^titular\b/.test(ln)) {
+      const vTit = getValueSameOrNext_(i);
+      if (expectTitularAs === 'origen' && vTit && !origen) origen = vTit;
+      if (expectTitularAs === 'destino' && vTit && !destino) destino = vTit;
+      expectTitularAs = null;
     }
   }
 
@@ -2024,63 +2039,88 @@ function procesarEmailsDeCuenta(emailOrigen) {
               ? 'ok'
               : (hasInlineImagesOrAttachments ? 'missing_with_attachment' : 'missing_no_attachment');
 
-            // Excluir por texto completo (incluye OCR) para frenar falsos positivos de adjuntos
-            const textoCompletoLower = fullTextForRules.toLowerCase();
-            const tieneExclusionFuerte = PALABRAS_EXCLUSION_FUERTE.some(p => textoCompletoLower.indexOf(p) !== -1);
-            if (tieneExclusionFuerte) {
-              log(`(Central) DESCARTADO por exclusión fuerte: ${subject}`);
-              thread.addLabel(etiquetaDescartado);
-              thread.removeLabel(etiquetaEnProceso);
-              clearThreadLease_(threadId);
-              threadFinalized = true;
-              break;
-            }
-
-            // Regla determinística: transferencias con Referencia/Motivo/Concepto no-expensa (ej: SAC)
-            const nonExpenseConcept = matchesNonExpenseConcept_(fullTextForRules);
-            if (nonExpenseConcept) {
-              log(`(Central) DESCARTADO por concepto no-expensa: ${nonExpenseConcept} | ${subject}`);
-              thread.addLabel(etiquetaDescartado);
-              thread.removeLabel(etiquetaEnProceso);
-              clearThreadLease_(threadId);
-              threadFinalized = true;
-              break;
-            }
-
-            // PASO 1: Validar con LLM (fail-open con 3 estados)
-            const validation = validateExpensePaymentWithLLM(subject, bodyForAI);
-            log(`(Central) Validator: decision=${validation.decision || 'unknown'} review=${validation.review ? 'yes' : 'no'} reason=${validation.reviewReason || ''} pago_claro=${pagoClaro ? 'yes' : 'no'}`);
-            if (validation.review) {
-              log(`(Central) REVIEW (intención no clara): ${validation.reviewReason || 'LLM_UNCERTAIN'}`);
-            }
-            
-            if (!validation.isValid) {
-              log(`(Central) ✗ LLM rejected: ${subject} | Reason: ${validation.reviewReason || 'LLM_REJECT'}`);
-              // No etiquetar como expensa - evitar re-procesamiento
-              thread.addLabel(etiquetaDescartado);
-              thread.removeLabel(etiquetaEnProceso);
-              clearThreadLease_(threadId);
-              threadFinalized = true;
-              break;
-            }
-            // Regla: si el titular DESTINO no parece consorcio/Artuso, descartar (falso positivo de pago saliente).
-            // Si no se detecta destino, pasar a REQUIERE REVISION (no descartar directamente).
-            const titulares = extractTitularesFromOcr_(ocrText || '');
-            const titularDestino = titulares.destino || '';
-            if (titularDestino && !isConsorcioLike_(titularDestino) && !isArtusoLike_(titularDestino)) {
-              log(`(Central) DESCARTADO: destino no-consorcio/no-Artuso (${titularDestino}) | ${subject}`);
-              thread.addLabel(etiquetaDescartado);
-              thread.removeLabel(etiquetaEnProceso);
-              clearThreadLease_(threadId);
-              threadFinalized = true;
-              break;
-            } else if (!titularDestino) {
-              log(`(Central) REQUIERE REVISION: destino no detectado en OCR | ${subject}`);
+            // Workflow:
+            // 1) Si hay >=2 comprobantes/imagenes OCR -> revisión humana (política cauta)
+            const receiptMarkersEarly = countReceiptMarkers_(ocrText);
+            if (receiptMarkersEarly >= 2) {
+              log(`(Central) REQUIERE REVISION: múltiples comprobantes (n=${receiptMarkersEarly}) | ${subject}`);
+              const etiquetaMultiples = crearObtenerEtiqueta(CONFIG.ETIQUETA_MULTIPLES_COMPROBANTES);
+              thread.addLabel(etiquetaMultiples);
               thread.addLabel(etiquetaRequiereRevision);
               thread.removeLabel(etiquetaEnProceso);
               clearThreadLease_(threadId);
               threadFinalized = true;
               break;
+            }
+
+            // 2) Si el OCR parece comprobante, validar destinatario (fuzzy consorcio/Artuso)
+            let acceptByDestino = false;
+            if (hasComprobante) {
+              const titularesOcr = extractTitularesFromOcr_(ocrText || '');
+              const titularDestinoOcr = (titularesOcr.destino || '').toString().trim();
+              if (!titularDestinoOcr) {
+                log(`(Central) REQUIERE REVISION: destino no detectado en OCR | ${subject}`);
+                thread.addLabel(etiquetaRequiereRevision);
+                thread.removeLabel(etiquetaEnProceso);
+                clearThreadLease_(threadId);
+                threadFinalized = true;
+                break;
+              }
+              const destinoOk = isConsorcioLike_(titularDestinoOcr) || isArtusoLike_(titularDestinoOcr);
+              if (!destinoOk) {
+                log(`(Central) DESCARTADO: destino no-consorcio/no-Artuso (${titularDestinoOcr}) | ${subject}`);
+                thread.addLabel(etiquetaDescartado);
+                thread.removeLabel(etiquetaEnProceso);
+                clearThreadLease_(threadId);
+                threadFinalized = true;
+                break;
+              }
+              acceptByDestino = true;
+              log(`(Central) ✓ Expensa confirmada por destinatario OCR: ${titularDestinoOcr}`);
+            }
+
+            // 3) Exclusions + LLM solo si NO se confirmó por destinatario OCR
+            let validation = { isValid: true, review: false, decision: 'accept', reviewReason: '' };
+            if (!acceptByDestino) {
+              // Excluir por texto completo (incluye OCR) para frenar falsos positivos de adjuntos
+              const textoCompletoLower = fullTextForRules.toLowerCase();
+              const tieneExclusionFuerte = PALABRAS_EXCLUSION_FUERTE.some(p => textoCompletoLower.indexOf(p) !== -1);
+              if (tieneExclusionFuerte) {
+                log(`(Central) DESCARTADO por exclusión fuerte: ${subject}`);
+                thread.addLabel(etiquetaDescartado);
+                thread.removeLabel(etiquetaEnProceso);
+                clearThreadLease_(threadId);
+                threadFinalized = true;
+                break;
+              }
+
+              // Regla determinística: transferencias con Referencia/Motivo/Concepto no-expensa (ej: SAC)
+              const nonExpenseConcept = matchesNonExpenseConcept_(fullTextForRules);
+              if (nonExpenseConcept) {
+                log(`(Central) DESCARTADO por concepto no-expensa: ${nonExpenseConcept} | ${subject}`);
+                thread.addLabel(etiquetaDescartado);
+                thread.removeLabel(etiquetaEnProceso);
+                clearThreadLease_(threadId);
+                threadFinalized = true;
+                break;
+              }
+
+              // PASO 1: Validar con LLM (fail-open con 3 estados)
+              validation = validateExpensePaymentWithLLM(subject, bodyForAI);
+              log(`(Central) Validator: decision=${validation.decision || 'unknown'} review=${validation.review ? 'yes' : 'no'} reason=${validation.reviewReason || ''} pago_claro=${pagoClaro ? 'yes' : 'no'}`);
+              if (validation.review) {
+                log(`(Central) REVIEW (intención no clara): ${validation.reviewReason || 'LLM_UNCERTAIN'}`);
+              }
+              
+              if (!validation.isValid) {
+                log(`(Central) ✗ LLM rejected: ${subject} | Reason: ${validation.reviewReason || 'LLM_REJECT'}`);
+                // No etiquetar como expensa - evitar re-procesamiento
+                thread.addLabel(etiquetaDescartado);
+                thread.removeLabel(etiquetaEnProceso);
+                clearThreadLease_(threadId);
+                threadFinalized = true;
+                break;
+              }
             }
             // Nota: si el LLM está en "review", dejamos pasar y lo marcamos en observaciones.
             

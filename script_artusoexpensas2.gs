@@ -632,13 +632,25 @@ function extractTitularesFromOcr_(ocrText) {
   function getValueSameOrNext_(idx) {
     const line = lines[idx] || '';
     let value = null;
+    // Caso "Label: valor"
     const m = /:\s*(.+)$/.exec(line);
     if (m && m[1]) value = m[1].trim();
+    // Caso "Label valor" en la misma línea
+    if (!value) {
+      const parts = line.split(/\s+/);
+      if (parts.length >= 2) {
+        const maybeVal = parts.slice(1).join(' ').trim();
+        const maybeNorm = normalizeAccountName_(maybeVal);
+        if (maybeVal && maybeNorm && !looksLikeLabelValue_(maybeNorm)) {
+          value = maybeVal;
+        }
+      }
+    }
+    // Caso línea siguiente como valor
     if (!value && (idx + 1 < lines.length)) {
       const next = (lines[idx + 1] || '').trim();
-      // Evitar tomar otra etiqueta como valor
       const nextNorm = normalizeAccountName_(next);
-      if (next && nextNorm && !/^(fecha|hora|importe|monto|cbu|cvu|alias|banco|cuenta|titular|beneficiario|destinatario|para|concepto|motivo|referencia|operacion|operación|nro|numero|número)\b/.test(nextNorm)) {
+      if (next && nextNorm && !looksLikeLabelValue_(nextNorm)) {
         value = next;
       }
     }
@@ -754,6 +766,49 @@ function countReceiptMarkers_(ocrText) {
   return markers ? markers.length : 0;
 }
 
+function splitOcrIntoBlocks_(ocrText) {
+  const text = (ocrText || '').toString();
+  const lines = text.split(/\r?\n/);
+  const blocks = [];
+  let current = null;
+
+  function pushCurrent_() {
+    if (current) {
+      current.text = current.lines.join('\n').trim();
+      blocks.push(current);
+      current = null;
+    }
+  }
+
+  for (var i = 0; i < lines.length; i++) {
+    const line = lines[i] || '';
+    const m = /^\[(adjunto|inline):\s*(.+?)\]/i.exec(line);
+    if (m) {
+      pushCurrent_();
+      current = { source: m[1].toLowerCase(), name: m[2], lines: [] };
+      continue;
+    }
+    if (!current) {
+      current = { source: 'unknown', name: '', lines: [] };
+    }
+    current.lines.push(line);
+  }
+  pushCurrent_();
+  return blocks;
+}
+
+function getReceiptLikeBlocks_(ocrText) {
+  const blocks = splitOcrIntoBlocks_(ocrText);
+  const receipts = [];
+  for (var i = 0; i < blocks.length; i++) {
+    const blk = blocks[i];
+    if (blk && blk.text && detectReceiptLikeOcr_(blk.text)) {
+      receipts.push(blk);
+    }
+  }
+  return receipts;
+}
+
 function extractPayerCuitFromOcr_(ocrText) {
   const t = (ocrText || '').toString();
   if (!t) return null;
@@ -842,6 +897,26 @@ function extractFechaFromOcr_(ocrText) {
   if (!m) return null;
   const yy = m[3].length === 4 ? m[3].substring(2) : m[3];
   return `${m[1]}-${m[2]}-${yy}`;
+}
+
+function parseDateFromText_(value) {
+  const s = (value || '').toString().trim();
+  if (!s) return null;
+  // Acepta DD-MM-YY(YY) o DD/MM/YY(YY) y tolera texto extra (p.ej. hora).
+  const m = /(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2}|\d{4})/.exec(s);
+  if (!m) return null;
+  const day = parseInt(m[1], 10);
+  const month = parseInt(m[2], 10);
+  let year = parseInt(m[3], 10);
+  if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
+  if (m[3].length === 2) year = 2000 + year;
+  if (day < 1 || day > 31 || month < 1 || month > 12) return null;
+  return { year: year, month: month, day: day };
+}
+
+function ymdInt_(parts) {
+  if (!parts) return null;
+  return (parts.year * 10000) + (parts.month * 100) + parts.day;
 }
 
 function extractMontosFromOcr_(ocrText) {
@@ -2031,9 +2106,10 @@ function procesarEmailsDeCuenta(emailOrigen) {
                 log(`(Central) OCR agregado (chars=${ocrText.length})`);
               }
             }
+            const receiptBlocks = getReceiptLikeBlocks_(ocrText);
+            const hasComprobante = receiptBlocks.length > 0 || (hasInlineImagesOrAttachments && detectReceiptLikeOcr_(ocrText));
             const bodyForAI = composeBodyWithOcr_(body, ocrText);
             const fullTextForRules = `${subject}\n${bodyForAI}`;
-            const hasComprobante = hasInlineImagesOrAttachments && detectReceiptLikeOcr_(ocrText);
             // Estado único (opción 2): OK vs falta comprobante (con o sin archivo)
             const highlightStatus = hasComprobante
               ? 'ok'
@@ -2041,9 +2117,10 @@ function procesarEmailsDeCuenta(emailOrigen) {
 
             // Workflow:
             // 1) Si hay >=2 comprobantes/imagenes OCR -> revisión humana (política cauta)
-            const receiptMarkersEarly = countReceiptMarkers_(ocrText);
-            if (receiptMarkersEarly >= 2) {
-              log(`(Central) REQUIERE REVISION: múltiples comprobantes (n=${receiptMarkersEarly}) | ${subject}`);
+            const receiptMarkersEarly = receiptBlocks.length || countReceiptMarkers_(ocrText);
+            if ((receiptBlocks.length >= 2) || receiptMarkersEarly >= 2) {
+              const nBlocks = receiptBlocks.length > 0 ? receiptBlocks.length : receiptMarkersEarly;
+              log(`(Central) REQUIERE REVISION: múltiples comprobantes (n=${nBlocks}) | ${subject}`);
               const etiquetaMultiples = crearObtenerEtiqueta(CONFIG.ETIQUETA_MULTIPLES_COMPROBANTES);
               thread.addLabel(etiquetaMultiples);
               thread.addLabel(etiquetaRequiereRevision);
@@ -2055,8 +2132,11 @@ function procesarEmailsDeCuenta(emailOrigen) {
 
             // 2) Si el OCR parece comprobante, validar destinatario (fuzzy consorcio/Artuso)
             let acceptByDestino = false;
+            var ocrTextForParse = ocrText;
+            if (receiptBlocks.length === 1) ocrTextForParse = receiptBlocks[0].text;
+
             if (hasComprobante) {
-              const titularesOcr = extractTitularesFromOcr_(ocrText || '');
+              const titularesOcr = extractTitularesFromOcr_(ocrTextForParse || '');
               const titularDestinoOcr = (titularesOcr.destino || '').toString().trim();
               if (!titularDestinoOcr) {
                 log(`(Central) REQUIERE REVISION: destino no detectado en OCR | ${subject}`);
@@ -2142,8 +2222,8 @@ function procesarEmailsDeCuenta(emailOrigen) {
               const currentDpto2 = (extractedData.dpto || '').toString().trim();
 
               // Determinar si hay múltiples recibos (marcadores de OCR de adjuntos/inline)
-              const receiptMarkers = countReceiptMarkers_(ocrText);
-              const multipleReceipts = receiptMarkers >= 2;
+              const receiptMarkers = receiptBlocks.length || countReceiptMarkers_(ocrText);
+              const multipleReceipts = receiptBlocks.length >= 2 || receiptMarkers >= 2;
               if (multipleReceipts) qaTags.push('QA_MULTIPLE_RECEIPTS');
               if (multipleReceipts) {
                 const etiquetaMultiples = crearObtenerEtiqueta(CONFIG.ETIQUETA_MULTIPLES_COMPROBANTES);
@@ -2152,7 +2232,7 @@ function procesarEmailsDeCuenta(emailOrigen) {
 
               // Deduplicación de montos por fuente solo cuando parece un único comprobante.
               if (!multipleReceipts) {
-                const montosFromOcr = ocrText ? (extractMontosFromOcr_(ocrText).montos || []) : [];
+                const montosFromOcr = ocrTextForParse ? (extractMontosFromOcr_(ocrTextForParse).montos || []) : [];
                 const montosFromBody = extractMontosFromTextLoose_(body);
                 const montosFromSubject = extractMontosFromTextLoose_(subject);
                 const montosFromLlm = (extractedData.montos || []).map(parseAmount_).filter(function(v) { return v != null; });
@@ -2264,6 +2344,16 @@ function procesarEmailsDeCuenta(emailOrigen) {
                   extractedData.fecha_pago = fechaFromOcr;
                   qaTags.push('FIX_FECHA_OCR');
                 }
+              }
+
+              // Control: fecha_pago debe ser <= fecha_aviso (fecha de recepción del mail).
+              const noticeParts = parseDateFromText_(noticeDate);
+              const pagoParts = parseDateFromText_(extractedData.fecha_pago);
+              const noticeYmd = ymdInt_(noticeParts);
+              const pagoYmd = ymdInt_(pagoParts);
+              if (noticeYmd != null && pagoYmd != null && pagoYmd > noticeYmd) {
+                extractedData.fecha_pago = noticeDate;
+                qaTags.push('FIX_FECHA_PAGO_GT_AVISO');
               }
 
               // Múltiples comprobantes: sumar montos si hay array

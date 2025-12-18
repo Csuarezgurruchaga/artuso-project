@@ -600,6 +600,25 @@ function normalizeAccountName_(name) {
   return normalizeForMatch_(name).replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
 }
 
+function looksLikeLabelValue_(normLine) {
+  // Evita tomar como valor una línea que en realidad es otra etiqueta de comprobante.
+  const s = (normLine || '').toString().trim();
+  if (!s) return false;
+  const labelStarts = [
+    'cbu', 'cvu', 'alias', 'banco', 'cuenta', 'cta',
+    'importe', 'monto', 'total', 'fecha', 'hora',
+    'nro', 'numero', 'operacion', 'transaccion',
+    'referencia', 'concepto', 'motivo', 'tipo de cuenta',
+    'titular', 'beneficiario', 'destinatario', 'ordenante', 'originante'
+  ];
+  for (var i = 0; i < labelStarts.length; i++) {
+    if (s.indexOf(labelStarts[i]) === 0) return true;
+  }
+  // Si es solo números (CBU, CUIT, referencias), probablemente no es nombre.
+  if (/^[0-9\s.\-]{8,}$/.test(s)) return true;
+  return false;
+}
+
 function isConsorcioLike_(value) {
   const n = normalizeAccountName_(value);
   if (!n) return false;
@@ -691,6 +710,22 @@ function extractTitularesFromOcr_(ocrText) {
       if (expectTitularAs === 'origen' && vTit && !origen) origen = vTit;
       if (expectTitularAs === 'destino' && vTit && !destino) destino = vTit;
       expectTitularAs = null;
+    }
+  }
+
+  // Fallback: línea suelta tipo "a Cons. ...", si no se encontró destino
+  if (!destino) {
+    for (var k = 0; k < lines.length; k++) {
+      const raw = lines[k] || '';
+      const norm = normalizeAccountName_(raw);
+      if (!norm) continue;
+      if (/^a\s+/.test(norm) || /^para\s+/.test(norm)) {
+        const after = raw.replace(/^\s*(a|para)\s+/i, '').trim();
+        if (after && (isConsorcioLike_(after) || isArtusoLike_(after))) {
+          destino = after;
+          break;
+        }
+      }
     }
   }
 
@@ -2291,13 +2326,14 @@ function procesarEmailsDeCuenta(emailOrigen) {
                 if (!hasSlash) qaTags.push(`SUG_ED_SLASH=${truncateText_(slashAddress, 45)}`);
               }
 
+              let dptoFromOcrNorm = null;
               if (ocrOnly) {
                 const edFromOcr = extractEdFromOcr_(ocrOnly);
                 if (edFromOcr && normalizeForMatch_(edFromOcr) !== normalizeForMatch_(currentEd2)) {
                   qaTags.push(`SUG_ED_OCR=${truncateText_(edFromOcr, 45)}`);
                 }
-              const dptoFromOcr = extractDeptoFromOcr_(ocrOnly) || extractDptoFromUnidadLike_(ocrOnly) || extractDeptoFromObservacionesOcr_(ocrOnly);
-                const dptoFromOcrNorm = normalizeDpto_(dptoFromOcr);
+                const dptoFromOcr = extractDeptoFromOcr_(ocrOnly) || extractDptoFromUnidadLike_(ocrOnly) || extractDeptoFromObservacionesOcr_(ocrOnly);
+                dptoFromOcrNorm = normalizeDpto_(dptoFromOcr);
                 if (dptoFromOcrNorm && normalizeForMatch_(dptoFromOcrNorm) !== normalizeForMatch_(currentDptoNorm || '')) {
                   qaTags.push(`SUG_DPTO_OCR=${truncateText_(dptoFromOcrNorm, 20)}`);
                   if (currentDptoNorm) qaTags.push(`WARN_DPTO_LLM=${truncateText_(currentDptoNorm, 20)}`);
@@ -2328,14 +2364,68 @@ function procesarEmailsDeCuenta(emailOrigen) {
                 qaTags.push('FIX_DPTO_TO_UF');
               }
 
-              // Normalización final de DPTO (ej: 04-C -> Piso 4 Dpto C)
-              if (extractedData.dpto) {
-                const normalizedFinalDpto = normalizeDpto_(extractedData.dpto);
-                if (normalizedFinalDpto && normalizedFinalDpto !== extractedData.dpto) {
-                  extractedData.dpto = normalizedFinalDpto;
-                  qaTags.push('FIX_DPTO_NORM');
-                }
+              // Buckets de unidades y cocheras (evita que cocheras pisen dptos)
+              const unitCandidates = [];
+              const cocheraCandidates = [];
+
+              function addUnitCandidate_(val, source) {
+                const raw = (val || '').toString().trim();
+                if (!raw) return;
+                if (/cochera/i.test(raw)) return; // se procesa aparte
+                const norm = normalizeDpto_(raw);
+                if (!norm) return;
+                unitCandidates.push({ value: norm, source: source || 'unknown' });
               }
+
+              function addCocheraCandidate_(val, source) {
+                const raw = (val || '').toString().trim();
+                if (!raw) return;
+                const norm = extractCocheraDptoFromText_(raw);
+                if (!norm) return;
+                cocheraCandidates.push({ value: norm, source: source || 'unknown' });
+              }
+
+              // LLM (valor actual)
+              if (extractedData.dpto) addUnitCandidate_(extractedData.dpto, 'llm');
+              // OCR sugerido
+              if (dptoFromOcrNorm) addUnitCandidate_(dptoFromOcrNorm, 'ocr');
+              // Email sugerido
+              if (emailDptoNorm) addUnitCandidate_(emailDptoNorm, 'body');
+              // Cocheras desde texto completo (email+OCR)
+              const cocheraFromText = extractCocheraDptoFromText_(fullTextForRules);
+              if (cocheraFromText) cocheraCandidates.push({ value: cocheraFromText, source: 'body_ocr' });
+
+              // Dedup y límite
+              const MAX_UNITS = 4;
+              const MAX_COCHERAS = 4;
+              function dedupCandidates_(arr) {
+                const out = [];
+                const seen = {};
+                for (var i = 0; i < arr.length; i++) {
+                  const v = (arr[i].value || '').toString().trim();
+                  const key = normalizeForMatch_(v);
+                  if (!v || !key || seen[key]) continue;
+                  seen[key] = true;
+                  out.push(arr[i]);
+                  if (out.length >= MAX_UNITS && arr === unitCandidates) break;
+                  if (out.length >= MAX_COCHERAS && arr === cocheraCandidates) break;
+                }
+                return out;
+              }
+
+              const unitsFinal = dedupCandidates_(unitCandidates);
+              const cocherasFinal = dedupCandidates_(cocheraCandidates);
+
+              // QA si se fusionaron múltiples fuentes
+              if (unitsFinal.length > 1) qaTags.push('QA_DPTO_MULTI');
+              if (cocherasFinal.length > 0 && unitsFinal.length === 0) qaTags.push('QA_DPTO_COCHERA_ONLY');
+              if (cocherasFinal.length > 0 && unitsFinal.length > 0) qaTags.push('QA_DPTO_COCHERA_MERGE');
+
+              // Componer DPTO final: unidades + cocheras (sin pisar)
+              const partsDpto = [];
+              unitsFinal.forEach(function(u) { partsDpto.push(u.value); });
+              cocherasFinal.forEach(function(c) { partsDpto.push(c.value); });
+              if (partsDpto.length) extractedData.dpto = partsDpto.join(', ');
 
               // Fallback determinístico de fecha de pago desde OCR si el LLM no la devolvió.
               if (!extractedData.fecha_pago && ocrText) {
@@ -2514,13 +2604,6 @@ function procesarEmailsDeCuenta(emailOrigen) {
               if (edFallbackApplied && (edFallbackKind === 'PAGADOR' || edFallbackKind === 'PAGADOR_CUIT' || edFallbackKind === 'FIRMA' || edFallbackKind === 'MOTIVO' || edFallbackKind === 'REENVIO')) {
                 qaTags.push('QA_ED_SIN_DIRECCION');
               }
-              // Fallback para cocheras: si el texto menciona cocheras con número, sobrescribir DPTO con cocheras.
-              const cocheraDpto = extractCocheraDptoFromText_(fullTextForRules);
-              if (cocheraDpto) {
-                extractedData.dpto = cocheraDpto;
-                qaTags.push('FIX_DPTO_COCHERA_OVERRIDE');
-              }
-
               const commentParts = [];
               if (validation.review) {
                 commentParts.push(`REVIEW: ${validation.reviewReason || 'LLM_UNCERTAIN'}`);

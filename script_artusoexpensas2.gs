@@ -2027,7 +2027,9 @@ function procesarEmailsDeCuenta(emailOrigen) {
     const threadsEnProceso = GmailApp.search(queryEnProceso, 0, CONFIG.MAX_THREADS_PER_RUN);
 
     const queryNuevos = `in:inbox -label:${escapeLabelForQuery_(labelProcesadoName)} -label:${escapeLabelForQuery_(labelDescartadoName)} -label:${escapeLabelForQuery_(labelEnProcesoName)} -label:${escapeLabelForQuery_(labelRequiereRevisionName)} newer_than:${days}d`;
-    const threadsNuevos = GmailApp.search(queryNuevos, 0, 100);
+    const threadsNuevos = GmailApp.search(queryNuevos, 0, CONFIG.MAX_THREADS_PER_RUN);
+    const threadsNuevosPlusOne = GmailApp.search(queryNuevos, 0, CONFIG.MAX_THREADS_PER_RUN + 1);
+    const hayMasNuevos = threadsNuevosPlusOne.length > threadsNuevos.length;
 
     const byId = {};
     const threads = [];
@@ -2048,7 +2050,7 @@ function procesarEmailsDeCuenta(emailOrigen) {
 
     const batch = threads.slice(0, CONFIG.MAX_THREADS_PER_RUN);
     log(`(Central) Threads en proceso: ${threadsEnProceso.length}, nuevos: ${threadsNuevos.length}, procesando: ${batch.length}`);
-    if (threadsEnProceso.length > 0 || threadsNuevos.length > CONFIG.MAX_THREADS_PER_RUN) {
+    if (threadsEnProceso.length > 0 || hayMasNuevos) {
       stats.needRerun = true;
       stats.rerunDelayMs = Math.max(stats.rerunDelayMs, 2 * 60 * 1000);
     }
@@ -2058,6 +2060,7 @@ function procesarEmailsDeCuenta(emailOrigen) {
     const etiquetaEnProceso = crearObtenerEtiqueta(labelEnProcesoName);
     const etiquetaRequiereRevision = crearObtenerEtiqueta(labelRequiereRevisionName);
 
+    const messagesByThread = GmailApp.getMessagesForThreads(batch);
     let totalMessagesRun = 0;
     for (var ti = 0; ti < batch.length; ti++) {
       const thread = batch[ti];
@@ -2077,7 +2080,7 @@ function procesarEmailsDeCuenta(emailOrigen) {
         thread.addLabel(etiquetaEnProceso);
         setThreadLease_(threadId, new Date());
 
-        const messages = thread.getMessages();
+        const messages = messagesByThread[ti] || [];
         const maxMessages = Math.min(messages.length, CONFIG.MAX_MESSAGES_PER_THREAD);
         let threadFinalized = false;
 

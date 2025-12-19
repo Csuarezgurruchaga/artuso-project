@@ -145,6 +145,16 @@ const PALABRAS_CLAVE_EXPENSA = {
     '@mercadopago.com',
     '@naranjax.com'
   ],
+  // NUEVO: Dominios bancarios confiables (para detectar avisos aunque cambie el remitente)
+  dominios_bancos: [
+    'bancogalicia.com.ar',
+    'mails.santander.com.ar',
+    'santander.com.ar',
+    'bbva.com.ar',
+    'mi-qr.com.ar',
+    'mercadopago.com',
+    'naranjax.com'
+  ],
   // NUEVO: Calles/direcciones comunes de Buenos Aires (para detectar "pago expensas [DIRECCIÓN]")
   direcciones: [
     'lavalle', 'peron', 'perón', 'paraguay', 'ocampo', 'córdoba', 'cordoba',

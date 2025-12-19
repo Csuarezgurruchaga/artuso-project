@@ -776,6 +776,33 @@ function extractForwardedSenderName_(plainBody) {
   return null;
 }
 
+function extractEmailFromHeader_(header) {
+  const raw = (header || '').toString();
+  if (!raw) return null;
+  const angle = /<([^>]+@[^>]+)>/.exec(raw);
+  if (angle && angle[1]) return angle[1].trim().toLowerCase();
+  const fallback = /([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/i.exec(raw);
+  return fallback && fallback[1] ? fallback[1].trim().toLowerCase() : null;
+}
+
+function extractEmailDomain_(email) {
+  const e = (email || '').toString().toLowerCase().trim();
+  if (!e) return null;
+  const at = e.lastIndexOf('@');
+  if (at === -1) return null;
+  const domain = e.substring(at + 1).trim();
+  return domain || null;
+}
+
+function extractForwardedSenderEmail_(plainBody) {
+  const body = (plainBody || '').toString();
+  if (!body) return null;
+
+  const beforeOriginal = body.split('--- CONTENIDO ORIGINAL ---')[0] || '';
+  const match = /([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/i.exec(beforeOriginal);
+  return match && match[1] ? match[1].trim().toLowerCase() : null;
+}
+
 function extractSignatureNameCandidate_(plainBody) {
   const original = extractForwardedOriginalBody_(plainBody);
   const lines = (original || '').split(/\r?\n/).map(function(l) { return (l || '').trim(); }).filter(Boolean);
@@ -843,6 +870,81 @@ function extractLabeledFieldValues_(text, labelNames, maxLen) {
   }
 
   return values.length ? values : null;
+}
+
+function isBankDomain_(domain) {
+  const d = (domain || '').toString().toLowerCase().trim();
+  if (!d) return false;
+  const list = PALABRAS_CLAVE_EXPENSA.dominios_bancos || [];
+  for (var i = 0; i < list.length; i++) {
+    const base = (list[i] || '').toString().toLowerCase().trim();
+    if (!base) continue;
+    if (d === base) return true;
+    if (d.endsWith('.' + base)) return true;
+  }
+  return false;
+}
+
+function isBankNotification_(message, subject, plainBody) {
+  const remitenteRaw = (message.getFrom() || '').toString().toLowerCase();
+  const senderEmail = extractEmailFromHeader_(remitenteRaw);
+  const forwardedEmail = extractForwardedSenderEmail_(plainBody);
+  const domains = [];
+
+  function pushDomain_(email) {
+    const d = extractEmailDomain_(email);
+    if (d && domains.indexOf(d) === -1) domains.push(d);
+  }
+
+  pushDomain_(senderEmail);
+  pushDomain_(forwardedEmail);
+
+  const hasBankDomain = domains.some(isBankDomain_);
+  const hasKnownSender = PALABRAS_CLAVE_EXPENSA.remitentes_bancos.some(function(r) {
+    return remitenteRaw.indexOf(r) !== -1;
+  });
+
+  const bodyCore = extractForwardedOriginalBody_(plainBody || '');
+  const text = normalizeForMatch_(`${subject || ''} ${bodyCore || ''}`);
+  const bankPhrases = [
+    'aviso de transferencia',
+    'aviso de pago',
+    'recibiste una transferencia',
+    'detalle de la operacion',
+    'te dejamos el detalle de la operacion',
+    'numero de operacion',
+    'nro de operacion',
+    'tipo de transferencia',
+    'datos del destinatario'
+  ];
+  const hasBankPhrase = bankPhrases.some(function(p) { return text.indexOf(p) !== -1; });
+  const hasBankFields = /(cbu|cvu|alias|banco|cuenta|cuit|cuil|numero de operacion|nro de operacion|tipo de transferencia)/.test(text);
+  const hasBankName = PALABRAS_CLAVE_EXPENSA.bancos.some(function(p) {
+    return text.indexOf(normalizeForMatch_(p)) !== -1;
+  });
+
+  return hasBankDomain || hasKnownSender || (hasBankPhrase && (hasBankFields || hasBankName));
+}
+
+function extractTransferTypeFromText_(text) {
+  const found = extractLabeledFieldValues_(text, [
+    'tipo de transferencia',
+    'tipo transferencia',
+    'tipo de operacion',
+    'tipo de operación'
+  ], 80);
+  if (!found) return null;
+  for (var i = 0; i < found.length; i++) {
+    const val = (found[i] && found[i].value) ? String(found[i].value).trim() : '';
+    if (val) return val;
+  }
+  return null;
+}
+
+function matchesProveedorTransferType_(text) {
+  const value = extractTransferTypeFromText_(text);
+  if (!value) return null;
+  return normalizeForMatch_(value).indexOf('proveedor') !== -1 ? value : null;
 }
 
 function extractMotivoDetalleNameFromOcr_(ocrText) {
@@ -1759,6 +1861,16 @@ const PALABRAS_CLAVE_EXPENSA = {
     '@mercadopago.com',
     '@naranjax.com'
   ],
+  // NUEVO: Dominios bancarios confiables (para detectar avisos aunque cambie el remitente)
+  dominios_bancos: [
+    'bancogalicia.com.ar',
+    'mails.santander.com.ar',
+    'santander.com.ar',
+    'bbva.com.ar',
+    'mi-qr.com.ar',
+    'mercadopago.com',
+    'naranjax.com'
+  ],
   // NUEVO: Calles/direcciones comunes de Buenos Aires (para detectar "pago expensas [DIRECCIÓN]")
   direcciones: [
     'lavalle', 'peron', 'perón', 'paraguay', 'ocampo', 'córdoba', 'cordoba',
@@ -1842,6 +1954,19 @@ INCERTO (REVIEW) si:
 Regla: reject SOLO con evidencia negativa clara. Si no, uncertain.
 
 El campo reason debe ser muy conciso (máx 12 palabras).`;
+
+const BANK_ROLES_PROMPT = `Tu tarea: en avisos bancarios de transferencia, detectar pagos a proveedores que NO son expensas.
+
+Devuelve SOLO este JSON válido (sin texto extra):
+{"should_discard":boolean,"confidence":"high|medium|low","payer":string|null,"payee":string|null,"transfer_type":"expensa|proveedor|sueldo|unknown","reason":"muy breve"}
+
+Reglas:
+- "payer" es quien ENVIA el dinero, "payee" quien RECIBE.
+- "should_discard" = true SOLO si hay evidencia clara de que el pagador es consorcio/administración
+  y el receptor es persona/empresa externa, o si dice explícitamente "Tipo de transferencia: Proveedor".
+- Si el pago va al consorcio/administración (beneficiario/destinatario consorcio), no descartar.
+- Si no hay evidencia clara, usa should_discard=false y confidence="low".
+`;
 
 function getRequiredConfigString_(value, keyName) {
   const v = (value || '').toString().trim();
@@ -1927,6 +2052,35 @@ function validateExpensePaymentWithLLM(subject, body) {
     log(`(Central) Error en validación LLM: ${e.toString()}`);
     // Fail-open, pero marcar como revisión
     return { isValid: true, review: true, reviewReason: 'LLM_ERROR', decision: 'error' };
+  }
+}
+
+function validateBankTransferRolesWithLLM_(subject, body) {
+  const coreBody = extractForwardedOriginalBody_(body || '');
+  const truncatedBody = truncateText_(coreBody || body || '', 2200);
+  const prompt = BANK_ROLES_PROMPT + `\n\nEmail:\nAsunto: ${subject}\nCuerpo: ${truncatedBody}`;
+
+  try {
+    const response = callAI(prompt);
+    const cleanResponse = response.replace(/```json\n?|\n?```/g, '').trim();
+    const json = JSON.parse(cleanResponse);
+    const shouldDiscardRaw = json.should_discard;
+    const shouldDiscard = shouldDiscardRaw === true || shouldDiscardRaw === 'true';
+    const confidenceRaw = (json.confidence || '').toString().toLowerCase().trim();
+    const confidence = (confidenceRaw === 'high' || confidenceRaw === 'medium' || confidenceRaw === 'low') ? confidenceRaw : 'low';
+    const reason = (json.reason || '').toString().trim();
+
+    return {
+      shouldDiscard: shouldDiscard,
+      confidence: confidence,
+      reason: reason.length > 80 ? reason.substring(0, 80) : reason,
+      payer: (json.payer || '').toString().trim() || null,
+      payee: (json.payee || '').toString().trim() || null,
+      transferType: (json.transfer_type || '').toString().trim().toLowerCase() || 'unknown'
+    };
+  } catch (e) {
+    log(`(Central) Error en roles LLM (banco): ${e.toString()}`);
+    return { shouldDiscard: false, confidence: 'low', reason: 'LLM_ERROR', payer: null, payee: null, transferType: 'unknown' };
   }
 }
 
@@ -2546,6 +2700,32 @@ function procesarEmailsDeCuenta(emailOrigen) {
                 clearThreadLease_(threadId);
                 threadFinalized = true;
                 break;
+              }
+
+              const isBankNotice = isBankNotification_(message, subject, body);
+              if (isBankNotice) {
+                const transferType = matchesProveedorTransferType_(fullTextForRules);
+                if (transferType) {
+                  log(`(Central) DESCARTADO: tipo de transferencia proveedor (${transferType}) | ${subject}`);
+                  thread.addLabel(etiquetaDescartado);
+                  setDiscardLastMsgMs_(threadId, thread.getLastMessageDate());
+                  thread.removeLabel(etiquetaEnProceso);
+                  clearThreadLease_(threadId);
+                  threadFinalized = true;
+                  break;
+                }
+
+                const bankRoles = validateBankTransferRolesWithLLM_(subject, body);
+                if (bankRoles.shouldDiscard && (bankRoles.confidence === 'high' || bankRoles.confidence === 'medium')) {
+                  const reason = bankRoles.reason ? ` | ${bankRoles.reason}` : '';
+                  log(`(Central) DESCARTADO: transferencia proveedor (LLM ${bankRoles.confidence})${reason} | ${subject}`);
+                  thread.addLabel(etiquetaDescartado);
+                  setDiscardLastMsgMs_(threadId, thread.getLastMessageDate());
+                  thread.removeLabel(etiquetaEnProceso);
+                  clearThreadLease_(threadId);
+                  threadFinalized = true;
+                  break;
+                }
               }
 
               // PASO 1: Validar con LLM (fail-open con 3 estados)

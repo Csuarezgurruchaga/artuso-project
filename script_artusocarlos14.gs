@@ -25,6 +25,19 @@ const CONFIG = {
 
 const MIN_INLINE_IMAGE_BYTES = 30 * 1024;
 
+function hasMoneyAmount_(text) {
+  const t = (text || '').toString();
+  // $ 65.199,02 | 65199.02 | 65.000,00 | 1000000
+  return /(?:\$\s*)?\d{1,3}(?:[\.\s]\d{3})+(?:,\d{2})?|\$\s*\d{4,}|\b\d{1,3}(?:\.\d{3})+(?:,\d{2})\b|\b\d{4,}(?:[.,]\d{2})\b/.test(t);
+}
+
+function hasTextReceiptEvidence_(text) {
+  const t = (text || '').toString().toLowerCase();
+  const hasTransferWord = /(transferenc|comprobante|voucher|constancia|operacion|operación)/.test(t);
+  const hasBankField = /\b(cbu|cvu|alias|cuenta|cuit|cuil|banco)\b/.test(t);
+  return hasTransferWord && hasBankField && hasMoneyAmount_(t);
+}
+
 // ==================== PALABRAS CLAVE PARA DETECCIÓN ====================
 const PALABRAS_CLAVE_EXPENSA = {
   expensa: [
@@ -253,8 +266,13 @@ function procesarEmailsDeCuenta(emailOrigen) {
         stats.procesados++;
 
         const threadId = thread.getId();
-        if (esComprobanteExpensa(mensaje)) {
+        const keywordEval = {};
+        const passKeywords = esComprobanteExpensa(mensaje, keywordEval);
+        if (passKeywords || keywordEval.review) {
           log(`✓ Email identificado como expensa: ${mensaje.getSubject()}`);
+          if (keywordEval.review) {
+            log(`  → Reenvío para revisión (${keywordEval.reason || 'EXCLUSION_FUERTE'})`);
+          }
           reenviarEmail(mensaje, todosLosAdjuntos);
           stats.reenviados++;
           thread.addLabel(crearObtenerEtiqueta(CONFIG.ETIQUETA_PROCESADO));
@@ -308,12 +326,19 @@ function encontrarMensajeComprobante(messages) {
 }
 
 // ==================== CLASIFICACIÓN ====================
-function esComprobanteExpensa(message) {
+function esComprobanteExpensa(message, result) {
+  const out = result || null;
+  if (out) {
+    out.review = false;
+    out.reason = '';
+    out.match = false;
+  }
   const asunto = (message.getSubject() || '').toLowerCase();
   const cuerpo = (message.getPlainBody() || '').toLowerCase();
   const remitente = (message.getFrom() || '').toLowerCase();
   const textoCompleto = `${asunto} ${cuerpo}`;
   const tieneAdjuntos = message.getAttachments().length > 0;
+  const tieneAdjuntoRelevante = hasRelevantAttachment_(message);
 
   let puntuacion = 0;
   let criteriosCumplidos = [];
@@ -331,9 +356,16 @@ function esComprobanteExpensa(message) {
   // ===== EXCLUSIONES FUERTES (descarta inmediatamente) =====
   const contieneExclusionFuerte = PALABRAS_EXCLUSION_FUERTE.some(p => textoCompleto.includes(p));
   if (contieneExclusionFuerte) {
+    const reviewByAttachment = tieneAdjuntoRelevante && out;
+    const reviewByText = !reviewByAttachment && out && hasTextReceiptEvidence_(textoCompleto);
+    const reviewAny = reviewByAttachment || reviewByText;
     if (CONFIG.DEBUG) {
       log(`Clasificación: ${message.getSubject()}`);
-      log(`  DESCARTADO: Contiene frase de exclusión fuerte`);
+      log(`  ${reviewAny ? 'REQUIERE REVISION' : 'DESCARTADO'}: Contiene frase de exclusión fuerte`);
+    }
+    if (reviewAny) {
+      out.review = true;
+      out.reason = reviewByAttachment ? 'EXCLUSION_FUERTE_ADJUNTO' : 'EXCLUSION_FUERTE_TEXTO';
     }
     return false;
   }
@@ -503,7 +535,9 @@ function esComprobanteExpensa(message) {
     return false;
   }
 
-  return puntuacion >= UMBRAL_MINIMO;
+  const pass = puntuacion >= UMBRAL_MINIMO;
+  if (out) out.match = pass;
+  return pass;
 }
 
 // ==================== REENVÍO ====================

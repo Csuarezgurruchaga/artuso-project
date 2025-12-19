@@ -307,6 +307,13 @@ function hasPaymentEvidence_(text) {
   return hasSignal && (hasMoneyAmount_(t) || /\b(cbu|cvu|alias)\b/.test(t));
 }
 
+function hasTextReceiptEvidence_(text) {
+  const t = (text || '').toString().toLowerCase();
+  const hasTransferWord = /(transferenc|comprobante|voucher|constancia|operacion|operación)/.test(t);
+  const hasBankField = /\b(cbu|cvu|alias|cuenta|cuit|cuil|banco)\b/.test(t);
+  return hasTransferWord && hasBankField && hasMoneyAmount_(t);
+}
+
 // Regla especial: descartar transferencias SALIENTES realizadas por Carlos Artuso.
 // Criterio: si aparece "Carlos" + "Artuso" y hay señales fuertes de "transferencia saliente",
 // entonces etiquetar como descartado, salvo que el mismo email indique explícitamente que fue ENTRANTE.
@@ -2578,7 +2585,8 @@ function procesarEmailsDeCuenta(emailOrigen) {
             threadFinalized = true;
             break;
           }
-          if (esComprobanteExpensa(message)) {
+          const keywordEval = {};
+          if (esComprobanteExpensa(message, keywordEval)) {
             log(`(Central) ✓ Expensa detectada por keywords: ${message.getSubject()}`);
             
             const subject = message.getSubject();
@@ -3202,6 +3210,15 @@ function procesarEmailsDeCuenta(emailOrigen) {
             stats.reenviados++; // usamos este campo como "marcados"
             threadFinalized = true;
             break;
+          } else if (keywordEval.review) {
+            const reason = keywordEval.reason || 'EXCLUSION_FUERTE';
+            log(`(Central) REQUIERE REVISION: ${reason} | ${message.getSubject()}`);
+            thread.addLabel(etiquetaRequiereRevision);
+            clearDiscardLastMsgMs_(threadId);
+            thread.removeLabel(etiquetaEnProceso);
+            clearThreadLease_(threadId);
+            threadFinalized = true;
+            break;
           } else {
             log(`(Central) ✗ NO es expensa (keywords): ${message.getSubject()}`);
           }
@@ -3243,12 +3260,19 @@ function procesarEmailsDeCuenta(emailOrigen) {
   return stats;
 }
 
-function esComprobanteExpensa(message) {
+function esComprobanteExpensa(message, result) {
+  const out = result || null;
+  if (out) {
+    out.review = false;
+    out.reason = '';
+    out.match = false;
+  }
   const asunto = (message.getSubject() || '').toLowerCase();
   const cuerpo = (message.getPlainBody() || '').toLowerCase();
   const remitente = (message.getFrom() || '').toLowerCase();
   const textoCompleto = `${asunto} ${cuerpo}`;
   const tieneAdjuntos = message.getAttachments().length > 0;
+  const tieneAdjuntoRelevante = hasRelevantAttachment_(message);
 
   let puntuacion = 0;
   let criteriosCumplidos = [];
@@ -3256,9 +3280,16 @@ function esComprobanteExpensa(message) {
   // ===== EXCLUSIONES FUERTES (descarta inmediatamente) =====
   const tieneExclusionFuerte = PALABRAS_EXCLUSION_FUERTE.some(p => textoCompleto.includes(p));
   if (tieneExclusionFuerte) {
+    const reviewByAttachment = tieneAdjuntoRelevante && out;
+    const reviewByText = !reviewByAttachment && out && hasTextReceiptEvidence_(textoCompleto);
+    const reviewAny = reviewByAttachment || reviewByText;
     if (CONFIG.DEBUG) {
       log(`(Central) Clasificación: ${message.getSubject()}`);
-      log(`  DESCARTADO: Coincide con exclusión fuerte`);
+      log(`  ${reviewAny ? 'REQUIERE REVISION' : 'DESCARTADO'}: Coincide con exclusión fuerte`);
+    }
+    if (reviewAny) {
+      out.review = true;
+      out.reason = reviewByAttachment ? 'EXCLUSION_FUERTE_ADJUNTO' : 'EXCLUSION_FUERTE_TEXTO';
     }
     return false;
   }
@@ -3417,7 +3448,9 @@ function esComprobanteExpensa(message) {
   }
 
   const UMBRAL_MINIMO = 5;
-  return puntuacion >= UMBRAL_MINIMO;
+  const pass = puntuacion >= UMBRAL_MINIMO;
+  if (out) out.match = pass;
+  return pass;
 }
 
 function crearObtenerEtiqueta(nombreEtiqueta) {

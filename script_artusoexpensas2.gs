@@ -13,7 +13,6 @@ const CONFIG = {
   ETIQUETA_EN_PROCESO: 'ExpensaEnProceso',
   ETIQUETA_REQUIERE_REVISION: 'REQUIERE REVISION',
   ETIQUETA_MULTIPLES_COMPROBANTES: 'MULTIPLES COMPROBANTES',
-  DIAS_BUSQUEDA: 1,
   MAX_THREADS_PER_RUN: 10,
   MAX_MESSAGES_PER_THREAD: 20,
   MAX_TOTAL_MESSAGES_PER_RUN: 40,
@@ -461,6 +460,210 @@ function extractCocheraDptoFromText_(text) {
 
   if (!nums.length) return null;
   return nums.map(function(n) { return `cochera${n}`; }).join(', ');
+}
+
+function findEvidenceLine_(text, needle) {
+  if (!text || !needle) return null;
+  const needleNorm = normalizeForMatch_(needle);
+  if (!needleNorm) return null;
+  const lines = (text || '').split(/\r?\n/);
+  for (var i = 0; i < lines.length; i++) {
+    const line = (lines[i] || '').trim();
+    if (!line) continue;
+    const lineNorm = normalizeForMatch_(line);
+    if (lineNorm.indexOf(needleNorm) !== -1) return line;
+  }
+  return null;
+}
+
+function collectUnitCandidates_(opts) {
+  const dpto = [];
+  const uf = [];
+  const seenDpto = {};
+  const seenUf = {};
+
+  function addDpto_(value, source, evidence) {
+    const raw = (value || '').toString().trim();
+    if (!raw) return;
+    if (/cochera/i.test(raw)) return;
+    const norm = normalizeDpto_(raw);
+    if (!norm) return;
+    const key = normalizeForMatch_(norm);
+    if (!key || seenDpto[key]) return;
+    seenDpto[key] = true;
+    dpto.push({ value: norm, source: source || 'unknown', evidence: evidence || null });
+  }
+
+  function addUf_(value, source, evidence) {
+    const raw = (value || '').toString().trim();
+    if (!raw) return;
+    const key = normalizeForMatch_(raw);
+    if (!key || seenUf[key]) return;
+    seenUf[key] = true;
+    uf.push({ value: raw, source: source || 'unknown', evidence: evidence || null });
+  }
+
+  addDpto_(opts.dptoFromLlm, 'llm', null);
+  addUf_(opts.ufFromLlm, 'llm', null);
+  addDpto_(opts.dptoFromEmail, 'email', opts.dptoEmailEvidence);
+  addDpto_(opts.dptoFromOcr, 'ocr', opts.dptoOcrEvidence);
+  addUf_(opts.ufFromOcr, 'ocr', opts.ufOcrEvidence);
+
+  return { dpto: dpto, uf: uf };
+}
+
+function hasUnitConflict_(candidates) {
+  if (!candidates) return false;
+  return (candidates.dpto && candidates.dpto.length > 1) ||
+    (candidates.uf && candidates.uf.length > 1);
+}
+
+function reconcileUnitsWithLLM_(subject, emailBody, ocrText, candidates) {
+  const dptoList = [];
+  const ufList = [];
+  const dptoMap = {};
+  const ufMap = {};
+
+  for (var i = 0; i < (candidates.dpto || []).length; i++) {
+    const c = candidates.dpto[i];
+    const id = 'D' + (i + 1);
+    dptoList.push({
+      id: id,
+      value: c.value,
+      source: c.source,
+      evidence: c.evidence || null
+    });
+    dptoMap[id] = c.value;
+  }
+
+  for (var j = 0; j < (candidates.uf || []).length; j++) {
+    const u = candidates.uf[j];
+    const uid = 'U' + (j + 1);
+    ufList.push({
+      id: uid,
+      value: u.value,
+      source: u.source,
+      evidence: u.evidence || null
+    });
+    ufMap[uid] = u.value;
+  }
+
+  const emailShort = truncateText_((emailBody || '').toString(), 1500);
+  const ocrShort = truncateText_((ocrText || '').toString(), 2000);
+
+  let dptoLines = dptoList.length ? '' : '(sin candidatos)';
+  if (dptoList.length) {
+    const parts = [];
+    for (var k = 0; k < dptoList.length; k++) {
+      const item = dptoList[k];
+      const ev = item.evidence ? ` | evidence="${item.evidence}"` : '';
+      parts.push(`${item.id}: "${item.value}" | source=${item.source}${ev}`);
+    }
+    dptoLines = parts.join('\n');
+  }
+
+  let ufLines = ufList.length ? '' : '(sin candidatos)';
+  if (ufList.length) {
+    const partsUf = [];
+    for (var m = 0; m < ufList.length; m++) {
+      const itemUf = ufList[m];
+      const evUf = itemUf.evidence ? ` | evidence="${itemUf.evidence}"` : '';
+      partsUf.push(`${itemUf.id}: "${itemUf.value}" | source=${itemUf.source}${evUf}`);
+    }
+    ufLines = partsUf.join('\n');
+  }
+
+  const prompt = `Selecciona DPTO y UF correctos SOLO usando la lista de candidatos.
+Si no hay evidencia suficiente o hay ambigüedad, devuelve null y confidence="low".
+
+Responde SOLO este JSON:
+{"dpto_id":string|null,"uf_id":string|null,"confidence":"high|medium|low","reason":"muy breve"}
+
+Reglas:
+- Usa solo ids D* o U* de la lista (no inventes valores).
+- Si confidence es "low", dpto_id y uf_id deben ser null.
+- Si no aplica UF o DPTO, usa null.
+
+CANDIDATOS DPTO:
+${dptoLines}
+
+CANDIDATOS UF:
+${ufLines}
+
+EMAIL_SUBJECT: ${subject || ''}
+EMAIL_BODY:
+${emailShort}
+
+OCR:
+${ocrShort}
+`;
+
+  try {
+    const response = callAI(prompt);
+    const cleanResponse = response.replace(/```json\n?|\n?```/g, '').trim();
+    const json = JSON.parse(cleanResponse);
+    const confidenceRaw = (json.confidence || '').toString().toLowerCase().trim();
+    const confidence = (confidenceRaw === 'high' || confidenceRaw === 'medium' || confidenceRaw === 'low') ? confidenceRaw : 'low';
+
+    if (confidence === 'low') {
+      return { dpto: null, uf: null, confidence: 'low', reason: (json.reason || '').toString() };
+    }
+
+    const dptoId = (json.dpto_id || '').toString().trim();
+    const ufId = (json.uf_id || '').toString().trim();
+    const dptoValue = dptoId && dptoMap[dptoId] ? dptoMap[dptoId] : null;
+    const ufValue = ufId && ufMap[ufId] ? ufMap[ufId] : null;
+
+    return {
+      dpto: dptoValue,
+      uf: ufValue,
+      confidence: confidence,
+      reason: (json.reason || '').toString()
+    };
+  } catch (e) {
+    log(`(Central) Error reconciliando DPTO/UF con LLM: ${e.toString()}`);
+    return { dpto: null, uf: null, confidence: 'low', reason: 'LLM_ERROR' };
+  }
+}
+
+function resolveUnitsWithReconciliation_(subject, emailBody, ocrText, candidates) {
+  const result = {
+    dpto: null,
+    uf: null,
+    dptoSource: null,
+    ufSource: null,
+    usedRecon: false,
+    lowConfidence: false
+  };
+
+  if (!hasUnitConflict_(candidates)) {
+    if (candidates.dpto && candidates.dpto.length === 1) {
+      result.dpto = candidates.dpto[0].value;
+      result.dptoSource = candidates.dpto[0].source;
+    }
+    if (candidates.uf && candidates.uf.length === 1) {
+      result.uf = candidates.uf[0].value;
+      result.ufSource = candidates.uf[0].source;
+    }
+    return result;
+  }
+
+  result.usedRecon = true;
+  const recon = reconcileUnitsWithLLM_(subject, emailBody, ocrText, candidates);
+  if (recon.confidence === 'low') {
+    result.lowConfidence = true;
+    return result;
+  }
+
+  if (recon.dpto) {
+    result.dpto = recon.dpto;
+    result.dptoSource = 'recon';
+  }
+  if (recon.uf) {
+    result.uf = recon.uf;
+    result.ufSource = 'recon';
+  }
+  return result;
 }
 
 function normalizePayor_(value) {
@@ -2226,7 +2429,6 @@ function procesarEmailsDeCuenta(emailOrigen) {
             
             const subject = message.getSubject();
             const body = message.getPlainBody();
-            const hasAttachments = message.getAttachments({ includeInlineImages: false }).length > 0;
             const hasInlineImagesOrAttachments = message.getAttachments({ includeInlineImages: true }).length > 0;
 
             // Señal simple de "pago claro" (para debugging)
@@ -2381,7 +2583,9 @@ function procesarEmailsDeCuenta(emailOrigen) {
 
               const qaTags = [];
               const currentEd2 = (extractedData.ed || '').toString();
-              const currentDpto2 = (extractedData.dpto || '').toString().trim();
+              const llmDpto = (extractedData.dpto || '').toString().trim();
+              const llmUf = (extractedData.uf || '').toString().trim();
+              const llmDptoNorm = normalizeDpto_(llmDpto);
 
               // Determinar si hay múltiples recibos (marcadores de OCR de adjuntos/inline)
               const receiptMarkers = receiptBlocks.length || countReceiptMarkers_(ocrText);
@@ -2429,18 +2633,14 @@ function procesarEmailsDeCuenta(emailOrigen) {
               }
 
               // Auditoría (no corrige): sugerencias desde email + OCR
-              const emailEd = extractEdFromEmailText_(fullTextForRules);
-              const emailDpto = extractDptoFromEmailText_(fullTextForRules);
-              const emailDptoNorm = normalizeDpto_(emailDpto);
-              const currentDptoNorm = normalizeDpto_(currentDpto2);
-              if (!extractedData.dpto && emailDptoNorm) {
-                extractedData.dpto = emailDptoNorm;
-                qaTags.push('FIX_DPTO_EMAIL');
-              }
+              const emailTextForExtract = `${subject}\n${body}`;
+              const emailEd = extractEdFromEmailText_(emailTextForExtract);
+              const emailDptoRaw = extractDptoFromEmailText_(emailTextForExtract);
+              const emailDptoNorm = normalizeDpto_(emailDptoRaw);
               if (emailEd && normalizeForMatch_(emailEd) !== normalizeForMatch_(currentEd2)) {
                 qaTags.push(`SUG_ED_EMAIL=${truncateText_(emailEd, 45)}`);
               }
-              if (emailDptoNorm && normalizeForMatch_(emailDptoNorm) !== normalizeForMatch_(currentDptoNorm || '')) {
+              if (emailDptoNorm && normalizeForMatch_(emailDptoNorm) !== normalizeForMatch_(llmDptoNorm || '')) {
                 qaTags.push(`SUG_DPTO_EMAIL=${truncateText_(emailDptoNorm, 20)}`);
               }
 
@@ -2453,106 +2653,124 @@ function procesarEmailsDeCuenta(emailOrigen) {
                 if (!hasSlash) qaTags.push(`SUG_ED_SLASH=${truncateText_(slashAddress, 45)}`);
               }
 
+              let dptoFromOcrRaw = null;
               let dptoFromOcrNorm = null;
+              let ufFromOcr = null;
               if (ocrOnly) {
                 const edFromOcr = extractEdFromOcr_(ocrOnly);
                 if (edFromOcr && normalizeForMatch_(edFromOcr) !== normalizeForMatch_(currentEd2)) {
                   qaTags.push(`SUG_ED_OCR=${truncateText_(edFromOcr, 45)}`);
                 }
-                const dptoFromOcr = extractDeptoFromOcr_(ocrOnly) || extractDptoFromUnidadLike_(ocrOnly) || extractDeptoFromObservacionesOcr_(ocrOnly);
-                dptoFromOcrNorm = normalizeDpto_(dptoFromOcr);
-                if (dptoFromOcrNorm && normalizeForMatch_(dptoFromOcrNorm) !== normalizeForMatch_(currentDptoNorm || '')) {
+                dptoFromOcrRaw = extractDeptoFromOcr_(ocrOnly) || extractDptoFromUnidadLike_(ocrOnly) || extractDeptoFromObservacionesOcr_(ocrOnly);
+                dptoFromOcrNorm = normalizeDpto_(dptoFromOcrRaw);
+                if (dptoFromOcrNorm && normalizeForMatch_(dptoFromOcrNorm) !== normalizeForMatch_(llmDptoNorm || '')) {
                   qaTags.push(`SUG_DPTO_OCR=${truncateText_(dptoFromOcrNorm, 20)}`);
-                  if (currentDptoNorm) qaTags.push(`WARN_DPTO_LLM=${truncateText_(currentDptoNorm, 20)}`);
-                  // Corrección de alta confianza si viene rotulado como Depto o Unidad con letra
-                  extractedData.dpto = dptoFromOcrNorm;
-                  qaTags.push('FIX_DPTO_OCR');
+                  if (llmDptoNorm) qaTags.push(`WARN_DPTO_LLM=${truncateText_(llmDptoNorm, 20)}`);
                 }
 
-                const ufFromOcr = extractUfFromOcr_(ocrOnly);
+                ufFromOcr = extractUfFromOcr_(ocrOnly);
                 if (ufFromOcr) {
-                  const currentUf = (extractedData.uf || '').toString().trim();
-                  if (!currentUf) {
-                    extractedData.uf = ufFromOcr;
+                  if (!llmUf) {
                     qaTags.push(`SUG_UF_OCR=${ufFromOcr}`);
-                    qaTags.push('FIX_UF_OCR');
-                  } else if (normalizeForMatch_(currentUf) !== normalizeForMatch_(ufFromOcr)) {
+                  } else if (normalizeForMatch_(llmUf) !== normalizeForMatch_(ufFromOcr)) {
                     qaTags.push(`SUG_UF_OCR=${ufFromOcr}`);
-                    qaTags.push(`WARN_UF_LLM=${truncateText_(currentUf, 20)}`);
+                    qaTags.push(`WARN_UF_LLM=${truncateText_(llmUf, 20)}`);
                   }
                 }
               }
 
-              // Si el LLM puso UF numérica en DPTO, mover a UF (alta confianza)
-              const dptoNumericOnly = /^[0-9]{2,6}$/.test((extractedData.dpto || '').toString().trim());
-              if (dptoNumericOnly && !extractedData.uf) {
-                extractedData.uf = (extractedData.dpto || '').toString().trim();
+              const dptoEmailEvidence = emailDptoRaw ? findEvidenceLine_(emailTextForExtract, emailDptoRaw) : null;
+              const dptoOcrEvidence = dptoFromOcrRaw ? findEvidenceLine_(ocrOnly, dptoFromOcrRaw) : null;
+              const ufOcrEvidence = ufFromOcr ? findEvidenceLine_(ocrOnly, ufFromOcr) : null;
+
+              const unitCandidates = collectUnitCandidates_({
+                dptoFromLlm: llmDpto,
+                ufFromLlm: llmUf,
+                dptoFromEmail: emailDptoNorm,
+                dptoFromOcr: dptoFromOcrNorm,
+                ufFromOcr: ufFromOcr,
+                dptoEmailEvidence: dptoEmailEvidence,
+                dptoOcrEvidence: dptoOcrEvidence,
+                ufOcrEvidence: ufOcrEvidence
+              });
+              const hasDptoConflict = unitCandidates.dpto.length > 1;
+              const hasUfConflict = unitCandidates.uf.length > 1;
+              const unitResolution = resolveUnitsWithReconciliation_(subject, body, ocrOnly || '', unitCandidates);
+              const unitReconLow = unitResolution.lowConfidence;
+
+              if (unitCandidates.dpto.length > 1) qaTags.push('QA_DPTO_MULTI');
+
+              if (unitReconLow) {
                 extractedData.dpto = null;
-                qaTags.push('FIX_DPTO_TO_UF');
-              }
-
-              // Buckets de unidades y cocheras (evita que cocheras pisen dptos)
-              const unitCandidates = [];
-              const cocheraCandidates = [];
-
-              function addUnitCandidate_(val, source) {
-                const raw = (val || '').toString().trim();
-                if (!raw) return;
-                if (/cochera/i.test(raw)) return; // se procesa aparte
-                const norm = normalizeDpto_(raw);
-                if (!norm) return;
-                unitCandidates.push({ value: norm, source: source || 'unknown' });
-              }
-
-              function addCocheraCandidate_(val, source) {
-                const raw = (val || '').toString().trim();
-                if (!raw) return;
-                const norm = extractCocheraDptoFromText_(raw);
-                if (!norm) return;
-                cocheraCandidates.push({ value: norm, source: source || 'unknown' });
-              }
-
-              // LLM (valor actual)
-              if (extractedData.dpto) addUnitCandidate_(extractedData.dpto, 'llm');
-              // OCR sugerido
-              if (dptoFromOcrNorm) addUnitCandidate_(dptoFromOcrNorm, 'ocr');
-              // Email sugerido
-              if (emailDptoNorm) addUnitCandidate_(emailDptoNorm, 'body');
-              // Cocheras desde texto completo (email+OCR)
-              const cocheraFromText = extractCocheraDptoFromText_(fullTextForRules);
-              if (cocheraFromText) cocheraCandidates.push({ value: cocheraFromText, source: 'body_ocr' });
-
-              // Dedup y límite
-              const MAX_UNITS = 4;
-              const MAX_COCHERAS = 4;
-              function dedupCandidates_(arr) {
-                const out = [];
-                const seen = {};
-                for (var i = 0; i < arr.length; i++) {
-                  const v = (arr[i].value || '').toString().trim();
-                  const key = normalizeForMatch_(v);
-                  if (!v || !key || seen[key]) continue;
-                  seen[key] = true;
-                  out.push(arr[i]);
-                  if (out.length >= MAX_UNITS && arr === unitCandidates) break;
-                  if (out.length >= MAX_COCHERAS && arr === cocheraCandidates) break;
+                extractedData.uf = null;
+                qaTags.push('QA_UNIT_RECON_LOW');
+              } else {
+                if (hasDptoConflict) {
+                  extractedData.dpto = unitResolution.dpto || null;
+                  if (unitResolution.dpto) {
+                    if (!llmDptoNorm || normalizeForMatch_(unitResolution.dpto) !== normalizeForMatch_(llmDptoNorm)) {
+                      qaTags.push('FIX_DPTO_LLM_RECON');
+                    }
+                  }
+                } else if (unitResolution.dptoSource) {
+                  extractedData.dpto = unitResolution.dpto;
+                  if (unitResolution.dptoSource === 'email') qaTags.push('FIX_DPTO_EMAIL');
+                  if (unitResolution.dptoSource === 'ocr') qaTags.push('FIX_DPTO_OCR');
                 }
-                return out;
+
+                if (hasUfConflict) {
+                  extractedData.uf = unitResolution.uf || null;
+                  if (unitResolution.uf) {
+                    if (!llmUf || normalizeForMatch_(unitResolution.uf) !== normalizeForMatch_(llmUf)) {
+                      qaTags.push('FIX_UF_LLM_RECON');
+                    }
+                  }
+                } else if (unitResolution.ufSource) {
+                  extractedData.uf = unitResolution.uf;
+                  if (unitResolution.ufSource === 'ocr') qaTags.push('FIX_UF_OCR');
+                }
               }
 
-              const unitsFinal = dedupCandidates_(unitCandidates);
-              const cocherasFinal = dedupCandidates_(cocheraCandidates);
+              if (!unitReconLow) {
+                // Si el LLM puso UF numérica en DPTO, mover a UF (alta confianza)
+                const dptoNumericOnly = /^[0-9]{2,6}$/.test((extractedData.dpto || '').toString().trim());
+                if (dptoNumericOnly && !extractedData.uf) {
+                  extractedData.uf = (extractedData.dpto || '').toString().trim();
+                  extractedData.dpto = null;
+                  qaTags.push('FIX_DPTO_TO_UF');
+                }
 
-              // QA si se fusionaron múltiples fuentes
-              if (unitsFinal.length > 1) qaTags.push('QA_DPTO_MULTI');
-              if (cocherasFinal.length > 0 && unitsFinal.length === 0) qaTags.push('QA_DPTO_COCHERA_ONLY');
-              if (cocherasFinal.length > 0 && unitsFinal.length > 0) qaTags.push('QA_DPTO_COCHERA_MERGE');
+                // Cocheras detectadas en el texto completo (email+OCR)
+                const cocheraCandidates = [];
+                const cocheraFromText = extractCocheraDptoFromText_(fullTextForRules);
+                if (cocheraFromText) cocheraCandidates.push({ value: cocheraFromText });
 
-              // Componer DPTO final: unidades + cocheras (sin pisar)
-              const partsDpto = [];
-              unitsFinal.forEach(function(u) { partsDpto.push(u.value); });
-              cocherasFinal.forEach(function(c) { partsDpto.push(c.value); });
-              if (partsDpto.length) extractedData.dpto = partsDpto.join(', ');
+                const MAX_COCHERAS = 4;
+                function dedupCandidates_(arr) {
+                  const out = [];
+                  const seen = {};
+                  for (var i = 0; i < arr.length; i++) {
+                    const v = (arr[i].value || '').toString().trim();
+                    const key = normalizeForMatch_(v);
+                    if (!v || !key || seen[key]) continue;
+                    seen[key] = true;
+                    out.push(arr[i]);
+                    if (out.length >= MAX_COCHERAS) break;
+                  }
+                  return out;
+                }
+
+                const cocherasFinal = dedupCandidates_(cocheraCandidates);
+                if (cocherasFinal.length > 0 && !extractedData.dpto) qaTags.push('QA_DPTO_COCHERA_ONLY');
+                if (cocherasFinal.length > 0 && extractedData.dpto) qaTags.push('QA_DPTO_COCHERA_MERGE');
+
+                const partsDpto = [];
+                if (extractedData.dpto) partsDpto.push(extractedData.dpto);
+                cocherasFinal.forEach(function(c) { partsDpto.push(c.value); });
+                if (partsDpto.length) extractedData.dpto = partsDpto.join(', ');
+              }
+
+              const currentDptoNorm = normalizeDpto_(extractedData.dpto);
 
               // Fallback determinístico de fecha de pago desde OCR si el LLM no la devolvió.
               if (!extractedData.fecha_pago && ocrText) {
@@ -2616,13 +2834,12 @@ function procesarEmailsDeCuenta(emailOrigen) {
               let edFallbackKind = '';
 
               const hasValidEd = buildingFinal && isValidEd_(buildingFinal);
-              const emailEdCandidate = extractEdFromEmailText_(fullTextForRules);
+              const emailEdCandidate = emailEd;
               const ocrEdCandidate = ocrOnly ? extractEdFromOcr_(ocrOnly) : null;
               const hasAnyValidAddressCandidate = (emailEdCandidate && isValidEd_(emailEdCandidate)) || (ocrEdCandidate && isValidEd_(ocrEdCandidate));
               // Fallback: si tenemos DPTO pero no ED, usar Beneficiario/Observaciones como identificador de edificio.
               if (!hasValidEd && !hasAnyValidAddressCandidate && currentDptoNorm) {
                 // Prioridad a Beneficiario en OCR
-                const ocrNorm = normalizeForMatch_(ocrOnly || '');
                 let ocrBenef = null;
                 const benefRe = /\bbeneficiario\b\s*:\s*([A-ZÁÉÍÓÚÑ0-9 .,'/-]{3,80})/i;
                 const mb = benefRe.exec(ocrOnly || '');

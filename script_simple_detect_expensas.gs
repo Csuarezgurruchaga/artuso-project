@@ -38,6 +38,11 @@ const EMAILS_EXCLUIR_DETECT = [
   'artusoexpensas2@gmail.com'
 ];
 
+const EMAILS_REQUIEREN_ADJUNTO_DETECT = [
+  // Remitentes automáticos: aceptar solo si traen adjunto real.
+  'webmaster@consorciosenredweb.com'
+];
+
 const REGEX_RESUMEN_PROCESAMIENTO_DETECT = /^resumen\s+procesamiento\s+expensas\s+-\s+\d{2}\/\d{2}\/\d{4}$/i;
 
 function procesarEmailsExpensasDetectadas() {
@@ -79,11 +84,7 @@ function procesarEmailsExpensasDetectadas() {
         continue;
       }
 
-      const matchMessage = messages.find(function(message) {
-        const subject = message.getSubject() || '';
-        const body = message.getPlainBody() || '';
-        return containsExpensaKeywordDetect_(subject) || containsExpensaKeywordDetect_(body);
-      });
+      const matchMessage = findEligibleMessageDetect_(messages);
 
       if (!matchMessage) {
         thread.addLabel(etiquetaNoPago);
@@ -145,6 +146,44 @@ function stripAccentsDetect_(text) {
   return (text || '').toString()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '');
+}
+
+function findEligibleMessageDetect_(messages) {
+  for (var i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    const subject = message.getSubject() || '';
+    const body = message.getPlainBody() || '';
+    if (!containsExpensaKeywordDetect_(subject) && !containsExpensaKeywordDetect_(body)) {
+      continue;
+    }
+    if (senderRequiresAttachmentDetect_(message) && !messageHasRealAttachmentsDetect_(message)) {
+      logDetect_(`SKIP remitente sin adjunto: ${message.getSubject()}`);
+      continue;
+    }
+    return message;
+  }
+  return null;
+}
+
+function senderRequiresAttachmentDetect_(message) {
+  const from = getSenderEmailDetect_(message.getFrom());
+  return EMAILS_REQUIEREN_ADJUNTO_DETECT.indexOf(from) !== -1;
+}
+
+function getSenderEmailDetect_(fromValue) {
+  const from = (fromValue || '').toString();
+  const angleMatch = from.match(/<([^>]+)>/);
+  let email = angleMatch && angleMatch[1] ? angleMatch[1] : '';
+  if (!email) {
+    const match = from.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+    email = match ? match[0] : from;
+  }
+  return (email || '').toLowerCase().trim();
+}
+
+function messageHasRealAttachmentsDetect_(message) {
+  const attachments = message.getAttachments({ includeInlineImages: false });
+  return attachments && attachments.length > 0;
 }
 
 function getMonthStartQueryDetect_() {
